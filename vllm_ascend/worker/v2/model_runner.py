@@ -41,7 +41,20 @@ from vllm.v1.worker.gpu.model_runner import (
     sort_batch_req_ids,
 )
 
-from vllm.v1.core.layered_prefill import LayeredPrefillStateStore
+from vllm.v1.core.layered_prefill import LayeredFrontier, LayeredPrefillStateStore
+from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT, ModelRunnerOutput
+from vllm.v1.worker.gpu.async_utils import AsyncOutput
+from vllm.v1.worker.gpu.dp_utils import dispatch_cg_and_sync_dp
+from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
+from vllm.v1.worker.gpu.cudagraph_utils import get_uniform_token_count
+from vllm.forward_context import BatchDescriptor, set_forward_context
+
+from vllm_ascend.worker.v2.layered_prefill import (
+    LayeredV2ExecuteModelState,
+    detach_execute_model_state,
+    split_d_p_req_ids,
+    subset_scheduler_output,
+)
 
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import (
@@ -231,6 +244,11 @@ class NPUModelRunner(GPUModelRunner):
                     "implemented yet (buffer isolation is in place; dual "
                     "sub-batch orchestration is pending)"
                 )
+            return self._execute_layered_step(
+                scheduler_output,
+                layered_plan,
+                intermediate_tensors=intermediate_tensors,
+            )
         if vllm_version_is("0.27.1"):
             return super().execute_model(
                 scheduler_output,
@@ -246,6 +264,438 @@ class NPUModelRunner(GPUModelRunner):
             skip_attn_for_dummy_run=skip_attn_for_dummy_run,
             is_profile=is_profile,
             context_len=context_len,
+        )
+
+    def load_model(self, load_dummy_weights: bool = False, *args, **kwargs) -> None:
+        super().load_model(load_dummy_weights, *args, **kwargs)
+        if self._layered_prefill_enabled:
+            from vllm_ascend.models.layered_prefill import (
+                create_layered_prefill_model_adapter,
+            )
+
+            try:
+                self.layered_prefill_model_adapter = create_layered_prefill_model_adapter(
+                    self.model
+                )
+            except TypeError as error:
+                raise RuntimeError(
+                    "The loaded model does not support layered prefill"
+                ) from error
+            # Orchestration (V2 milestone) is wired; flip the fail-closed gate.
+            self._layered_prefill_v2_ready = True
+
+    def _execute_layered_step(
+        self,
+        scheduler_output: SchedulerOutput,
+        layered_plan,
+        intermediate_tensors: IntermediateTensors | None = None,
+    ):
+        """D then P dual sub-batch orchestration (milestone V2, PP=1 eager).
+
+        Execution order D→P is a correctness constraint: Ascend stores
+        model_state.attn_metadata as instance state consumed by
+        ModelAclGraphManager.run_fullgraph (see migration plan §3.1).
+        """
+        if self.parallel_config.pipeline_parallel_size > 1:
+            raise NotImplementedError(
+                "layered_prefill_config on Model Runner V2 does not support PP>1 yet"
+            )
+        if intermediate_tensors is not None:
+            raise NotImplementedError(
+                "layered_prefill_config on Model Runner V2 does not support "
+                "PP intermediate tensors yet"
+            )
+        if self.layered_prefill_model_adapter is None:
+            raise RuntimeError(
+                "The loaded model does not have a layered prefill adapter"
+            )
+
+        finished = getattr(scheduler_output, "finished_req_ids", ()) or ()
+        preempted = getattr(scheduler_output, "preempted_req_ids", None) or ()
+        self.layered_prefill_state.clear_many(finished)
+        if preempted:
+            self.layered_prefill_state.clear_many(preempted)
+
+        d_req_ids, p_req_ids = split_d_p_req_ids(scheduler_output, layered_plan)
+
+        # One scheduler step → one lifecycle pass.  Must cover *all* new/cached
+        # rows (including the P request) before either sub-batch forward.
+        # Otherwise a concurrent Decode/other-Prefill sub-batch can consume
+        # one-time updates and leave the P request missing from req_states.
+        self._apply_scheduler_lifecycle(scheduler_output)
+        # Ascend builds seq_lens from num_computed_tokens_cpu.  That mirror is
+        # normally refreshed in prepare_inputs only for scheduled_cached_reqs
+        # rows; D/P sub-batches strip those fields to avoid double
+        # update_requests, so sync explicitly here.
+        self._sync_ascend_num_computed_tokens_cpu(
+            list(scheduler_output.num_scheduled_tokens)
+        )
+
+        d_state: ExecuteModelState | None = None
+        # D before P: Ascend stores attn_metadata on model_state for fullgraph.
+        if d_req_ids:
+            d_output = subset_scheduler_output(
+                scheduler_output,
+                d_req_ids,
+                layered_plan=None,
+                include_one_time_updates=False,
+            )
+            # Lifecycle already applied; strip rows that would re-enter it.
+            d_output = self._strip_lifecycle_fields(d_output)
+            result = super().execute_model(d_output, intermediate_tensors=None)
+            if result is not None:
+                raise RuntimeError(
+                    "Layered Prefill V2 D sub-batch returned an unexpected output"
+                )
+            d_state = self.execute_model_state
+            self.execute_model_state = None
+            if d_state is None:
+                raise RuntimeError("Layered Prefill V2 D sub-batch missing execute state")
+            if p_req_ids:
+                # P reuses model activation scratch; keep D logits inputs alive.
+                d_state = detach_execute_model_state(d_state)
+                # Establish a stream boundary before P may pick a different
+                # MoE backend / attention workspace.
+                torch.npu.synchronize()
+
+        p_state: ExecuteModelState | None = None
+        if p_req_ids:
+            p_output = subset_scheduler_output(
+                scheduler_output,
+                p_req_ids,
+                layered_plan=layered_plan,
+                include_one_time_updates=False,
+            )
+            with self._layered_p_buffers():
+                p_state = self._run_layered_prefill_subbatch(p_output, layered_plan)
+            torch.npu.synchronize()
+
+        self.execute_model_state = LayeredV2ExecuteModelState(
+            scheduler_output=scheduler_output,
+            d_state=d_state,
+            p_state=p_state,
+            sample_p=bool(layered_plan.is_final_group),
+        )
+        return None
+
+    @staticmethod
+    def _strip_lifecycle_fields(scheduler_output: SchedulerOutput) -> SchedulerOutput:
+        """Clear one-shot lifecycle fields after they have already been applied."""
+        from vllm.v1.core.sched.output import CachedRequestData
+        from dataclasses import replace
+
+        return replace(
+            scheduler_output,
+            scheduled_new_reqs=[],
+            scheduled_cached_reqs=CachedRequestData.make_empty(),
+            finished_req_ids=set(),
+            preempted_req_ids=set(),
+            free_encoder_mm_hashes=[],
+            scheduled_encoder_input_stats=None,
+            new_block_ids_to_zero=None,
+            kv_cache_block_copies=None,
+            kv_connector_metadata=None,
+            ec_connector_metadata=None,
+            ec_manager_metadata=None,
+        )
+
+    def _apply_scheduler_lifecycle(self, scheduler_output: SchedulerOutput) -> None:
+        """Run the one-shot request lifecycle that opens execute_model."""
+        self.update_pp_decode_requests()
+        self.finish_requests(scheduler_output)
+        self.free_states(scheduler_output)
+        self.add_requests(scheduler_output)
+        self.update_requests(scheduler_output)
+        self.block_tables.apply_staged_writes()
+
+    def _sync_ascend_num_computed_tokens_cpu(self, req_ids: list[str]) -> None:
+        """Refresh Ascend's CPU num_computed mirror after lifecycle.
+
+        ``update_requests`` only writes ``num_computed_tokens_np``.  Ascend's
+        ``_update_seq_lens_cpu`` copies np→cpu for cached rows; when those rows
+        are stripped for the D/P sub-batches, a stale cpu value makes
+        ``seq_lens = cpu + scheduled`` one step behind and decode collapses.
+        """
+        for req_id in req_ids:
+            req_index = self.req_states.req_id_to_index[req_id]
+            self.req_states.num_computed_tokens_cpu[req_index] = int(
+                self.req_states.num_computed_tokens_np[req_index]
+            )
+
+    def _run_layered_prefill_subbatch(
+        self,
+        scheduler_output: SchedulerOutput,
+        layered_plan,
+    ) -> ExecuteModelState:
+        """Eager P sub-batch: prepare_inputs → prepare_attn → adapter.forward."""
+        if scheduler_output.total_num_scheduled_tokens == 0:
+            raise RuntimeError("Layered Prefill P sub-batch has zero tokens")
+
+        num_reqs = len(scheduler_output.num_scheduled_tokens)
+        num_toks = scheduler_output.total_num_scheduled_tokens
+        max_query_len = max(scheduler_output.num_scheduled_tokens.values())
+        uniform_tok_count = get_uniform_token_count(num_reqs, num_toks, max_query_len)
+
+        # Prefill layer groups stay eager (migration plan §2 / V4).
+        batch_desc, num_tokens_across_dp = dispatch_cg_and_sync_dp(
+            self.cudagraph_manager,
+            num_reqs,
+            num_toks,
+            uniform_tok_count,
+            self.dp_size,
+            self.dp_rank,
+            need_eager=True,
+            num_active_loras=0,
+        )
+        if batch_desc.cg_mode != CUDAGraphMode.NONE:
+            raise RuntimeError(
+                "Layered Prefill P sub-batch must stay eager "
+                f"(got cudagraph mode {batch_desc.cg_mode})"
+            )
+        if batch_desc.num_tokens == 0:
+            raise RuntimeError("Layered Prefill P sub-batch dispatched zero tokens")
+        if batch_desc.num_tokens != num_toks:
+            raise RuntimeError(
+                "Layered prefill Phase 1 does not support padded eager batches"
+            )
+
+        if not vllm_version_is("0.27.1"):
+            raise NotImplementedError(
+                "Layered Prefill V2 P path currently requires the 0.27.1-shaped "
+                "prepare_inputs API (set VLLM_VERSION=0.27.1 on this tree)"
+            )
+
+        input_batch = self.prepare_inputs(scheduler_output, batch_desc)
+        block_tables, slot_mappings = self.prepare_attn(input_batch)
+        self.model_state.preprocess_state(
+            input_batch,
+            block_tables,
+            self.kv_cache_config,
+            self.req_states.num_computed_tokens.gpu,
+        )
+
+        slot_mappings_by_layer = build_slot_mappings_by_layer(
+            slot_mappings, self.kv_cache_config
+        )
+        attn_metadata = self.model_state.prepare_attn(
+            input_batch,
+            batch_desc.cg_mode,
+            block_tables,
+            slot_mappings,
+            self.attn_groups,
+            self.kv_cache_config,
+            for_capture=False,
+        )
+
+        input_ids = input_batch.input_ids
+        inputs_embeds = None
+        positions = input_batch.positions
+        num_tokens_padded = input_batch.num_tokens_after_padding
+
+        batch_descriptor = BatchDescriptor(
+            num_tokens=num_tokens_padded,
+            has_lora=False,
+            num_active_loras=0,
+        )
+        layered_adapter = self.layered_prefill_model_adapter
+        assert layered_adapter is not None
+        req_id = layered_plan.prefill_req_ids[0]
+        frontier = self.layered_prefill_state.get(req_id)
+
+        with set_forward_context(
+            attn_metadata,
+            self.vllm_config,
+            num_tokens=num_tokens_padded,
+            cudagraph_runtime_mode=batch_desc.cg_mode,
+            num_tokens_across_dp=num_tokens_across_dp,
+            batch_descriptor=batch_descriptor,
+            slot_mapping=slot_mappings_by_layer,
+            skip_compiled=True,
+            is_padding=input_batch.is_padding,
+        ):
+            self.kv_connector.pre_forward(scheduler_output)
+
+            if layered_plan.group_id > 0:
+                if frontier is None:
+                    raise RuntimeError(
+                        f"Missing layered activation frontier for request {req_id}"
+                    )
+                if frontier.group_id != layered_plan.group_id:
+                    raise RuntimeError(
+                        f"Layered frontier group mismatch for {req_id}: expected "
+                        f"{layered_plan.group_id}, got {frontier.group_id}"
+                    )
+                frontier_tuple = (frontier.hidden_states, frontier.residual)
+                initial_inputs_embeds = None
+            else:
+                if frontier is not None:
+                    raise RuntimeError(
+                        f"Unexpected layered frontier for group 0 request {req_id}"
+                    )
+                frontier_tuple = None
+                initial_inputs_embeds = inputs_embeds
+
+            layered_output = layered_adapter.forward(
+                input_ids=input_ids,
+                positions=positions[:num_tokens_padded],
+                layer_start=layered_plan.group_start,
+                layer_end=layered_plan.group_end,
+                frontier=frontier_tuple,
+                inputs_embeds=initial_inputs_embeds,
+                intermediate_tensors=None,
+            )
+
+        if layered_output.hidden_states.shape[0] != num_tokens_padded:
+            raise RuntimeError(
+                "Layered model returned a hidden-state row count that "
+                "does not match the P query batch"
+            )
+        if layered_output.is_final_layer != layered_plan.is_final_group:
+            raise RuntimeError(
+                "Layered model final-layer status does not match the plan"
+            )
+
+        if layered_plan.is_final_group:
+            self.layered_prefill_state.clear(req_id)
+            hidden_states = layered_output.hidden_states
+        else:
+            frontier_hidden = layered_output.hidden_states.clone()
+            frontier_residual = (
+                layered_output.residual.clone()
+                if layered_output.residual is not None
+                else None
+            )
+            self.layered_prefill_state.put(
+                LayeredFrontier(
+                    req_id=req_id,
+                    group_id=layered_plan.group_id + 1,
+                    query_len=layered_plan.query_tokens[req_id],
+                    hidden_states=frontier_hidden,
+                    residual=frontier_residual,
+                )
+            )
+            # Intermediate groups are not sampled; leave hidden_states unset.
+            hidden_states = None
+
+        return ExecuteModelState(
+            input_batch=input_batch,
+            attn_metadata=attn_metadata,
+            slot_mappings_by_layer=slot_mappings_by_layer,
+            hidden_states=hidden_states,
+            aux_hidden_states=None,
+            finished_req_ids=scheduler_output.finished_req_ids,
+        )
+
+    @torch.inference_mode()
+    def sample_tokens(self, grammar_output=None):
+        state = self.execute_model_state
+        if isinstance(state, LayeredV2ExecuteModelState):
+            return self._sample_layered_v2(grammar_output, state)
+        return super().sample_tokens(grammar_output)
+
+    def _sample_layered_v2(self, grammar_output, state: LayeredV2ExecuteModelState):
+        outputs: list[ModelRunnerOutput] = []
+        try:
+            if state.d_state is not None:
+                self.execute_model_state = state.d_state
+                active_grammar = grammar_output
+                if grammar_output is not None and not any(
+                    req_id in grammar_output.structured_output_request_ids
+                    for req_id in state.d_state.input_batch.req_ids
+                ):
+                    active_grammar = None
+                output = super().sample_tokens(active_grammar)
+                if isinstance(output, AsyncOutput):
+                    output = output.get_output()
+                if output is None:
+                    output = EMPTY_MODEL_RUNNER_OUTPUT
+                if not isinstance(output, ModelRunnerOutput):
+                    raise RuntimeError("Layered Prefill D sampling returned PP tensors")
+                outputs.append(output)
+
+            if state.p_state is not None:
+                if state.sample_p:
+                    self.execute_model_state = state.p_state
+                    output = super().sample_tokens(None)
+                    if isinstance(output, AsyncOutput):
+                        output = output.get_output()
+                    if output is None:
+                        output = EMPTY_MODEL_RUNNER_OUTPUT
+                    if not isinstance(output, ModelRunnerOutput):
+                        raise RuntimeError(
+                            "Layered Prefill P sampling returned PP tensors"
+                        )
+                    outputs.append(output)
+                else:
+                    # Intermediate group: skip sampler / token-progress append,
+                    # but still emit req_ids so scheduler.update_from_output
+                    # can find every scheduled request (empty sampled tokens).
+                    finished = state.p_state.finished_req_ids
+                    self.execute_model_state = None
+                    kv_out = self.kv_connector.post_forward(finished)
+                    p_req_ids = list(state.p_state.input_batch.req_ids)
+                    outputs.append(
+                        ModelRunnerOutput(
+                            req_ids=p_req_ids,
+                            req_id_to_index={
+                                req_id: i for i, req_id in enumerate(p_req_ids)
+                            },
+                            sampled_token_ids=[[] for _ in p_req_ids],
+                            kv_connector_output=kv_out,
+                        )
+                    )
+        finally:
+            self.execute_model_state = None
+
+        if not outputs:
+            return EMPTY_MODEL_RUNNER_OUTPUT
+        if len(outputs) == 1:
+            return outputs[0]
+        return self._merge_layered_v2_outputs(state.scheduler_output, outputs)
+
+    @staticmethod
+    def _merge_layered_v2_outputs(
+        scheduler_output: SchedulerOutput,
+        outputs: list[ModelRunnerOutput],
+    ) -> ModelRunnerOutput:
+        by_req_id: dict[str, tuple[ModelRunnerOutput, int]] = {}
+        for output in outputs:
+            for index, req_id in enumerate(output.req_ids):
+                by_req_id[req_id] = (output, index)
+        req_ids = list(scheduler_output.num_scheduled_tokens)
+        sampled_token_ids = [
+            by_req_id[req_id][0].sampled_token_ids[by_req_id[req_id][1]]
+            if req_id in by_req_id
+            else []
+            for req_id in req_ids
+        ]
+        prompt_logprobs: dict = {}
+        num_nans: dict = {}
+        for output in outputs:
+            prompt_logprobs.update(output.prompt_logprobs_dict)
+            if output.num_nans_in_logits:
+                num_nans.update(output.num_nans_in_logits)
+        return ModelRunnerOutput(
+            req_ids=req_ids,
+            req_id_to_index={req_id: index for index, req_id in enumerate(req_ids)},
+            sampled_token_ids=sampled_token_ids,
+            logprobs=next((o.logprobs for o in outputs if o.logprobs is not None), None),
+            prompt_logprobs_dict=prompt_logprobs,
+            pooler_output=[],
+            kv_connector_output=next(
+                (o.kv_connector_output for o in outputs if o.kv_connector_output),
+                None,
+            ),
+            ec_connector_output=next(
+                (o.ec_connector_output for o in outputs if o.ec_connector_output),
+                None,
+            ),
+            num_nans_in_logits=num_nans or None,
+            cudagraph_stats=next(
+                (o.cudagraph_stats for o in outputs if o.cudagraph_stats),
+                None,
+            ),
+            routed_experts=None,
         )
 
     @torch.inference_mode()
