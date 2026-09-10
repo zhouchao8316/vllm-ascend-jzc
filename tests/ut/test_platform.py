@@ -267,6 +267,44 @@ class TestNPUPlatform(TestBase):
         with pytest.raises(ValueError, match="requires VLLM_COMPILE"):
             _check_ascend_config(vllm_config, ascend_config)
 
+    def test_layered_prefill_allows_v2_through_platform_gates(self):
+        """V0: platform no longer hard-rejects V2; runner fails closed later."""
+        vllm_config = self.mock_vllm_config()
+        vllm_config.use_v2_model_runner = True
+        vllm_config.parallel_config.tensor_parallel_size = 1
+        vllm_config.parallel_config.pipeline_parallel_size = 1
+        vllm_config.parallel_config.data_parallel_size = 1
+        vllm_config.parallel_config.enable_dbo = False
+        vllm_config.parallel_config.enable_eplb = False
+        vllm_config.parallel_config.use_sequence_parallel_moe = False
+        vllm_config.model_config.architectures = ["Qwen3MoeForCausalLM"]
+        vllm_config.model_config.enforce_eager = True
+        vllm_config.model_config.is_multimodal = False
+        vllm_config.model_config.is_multimodal_model = False
+        vllm_config.model_config.enable_return_routed_experts = False
+        vllm_config.model_config.hf_text_config = SimpleNamespace(
+            model_type="qwen3_moe", num_hidden_layers=48
+        )
+        vllm_config.lora_config = None
+        vllm_config.compilation_config.mode = CompilationMode.NONE
+        vllm_config.compilation_config.cudagraph_mode = CUDAGraphMode.NONE
+        vllm_config.scheduler_config.async_scheduling = False
+        vllm_config.cache_config.enable_prefix_caching = False
+        vllm_config.cache_config.kv_offloading_size = None
+        vllm_config.cache_config.mamba_cache_mode = "none"
+
+        ascend_config = self.mock_vllm_ascend_config()
+        ascend_config.scheduler_config.layered_prefill_config = SimpleNamespace(
+            enabled=True, require_eager=True
+        )
+        ascend_config.sparse_kv_offload_config.enabled = False
+        ascend_config.eplb_config.dynamic_eplb = False
+        ascend_config.enable_prefill_mc2 = False
+        ascend_config.multistream_overlap_shared_expert = False
+
+        # Must not raise — V2 + layered is deferred to the runner.
+        _check_ascend_config(vllm_config, ascend_config)
+
     def test_get_recompute_scheduler_cls(self):
         from vllm_ascend import platform
 

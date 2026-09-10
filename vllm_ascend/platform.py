@@ -885,10 +885,11 @@ def _check_ascend_config(vllm_config: VllmConfig, ascend_config) -> None:
         # sequence parallelism is still rejected below because it changes the
         # frontier/token-row layout.  DP remains restricted to one rank until
         # the scheduler plan is synchronized across DP/EP ranks.
-        if getattr(vllm_config, "use_v2_model_runner", False):
-            raise ValueError(
-                "layered_prefill_config Phase 1 requires the V1 model runner"
-            )
+        #
+        # Model Runner V2 is allowed through these platform gates (layered
+        # remains default-off).  Until the V2 orchestration lands, the Ascend
+        # V2 NPUModelRunner fails closed with NotImplementedError when a
+        # layered_prefill_plan is present — see worker/v2/model_runner.py.
         if vllm_config.scheduler_config.async_scheduling:
             raise ValueError(
                 "layered_prefill_config Phase 1 does not support async_scheduling"
