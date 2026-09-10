@@ -41,6 +41,8 @@ from vllm.v1.worker.gpu.model_runner import (
     sort_batch_req_ids,
 )
 
+from vllm.v1.core.layered_prefill import LayeredPrefillStateStore
+
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import (
     MoECommType,
@@ -139,6 +141,26 @@ class NPUModelRunner(GPUModelRunner):
             device=self.device,
         )
 
+        # Layered Prefill V2: second buffer set for the P sub-batch.  V2's
+        # prepare_inputs writes through self.input_buffers views, so D and P
+        # must not share storage.  See layered_prefill_v2_migration_plan.md §3.1.
+        layered_cfg = self.ascend_config.scheduler_config.layered_prefill_config
+        self._layered_prefill_enabled = bool(layered_cfg.enabled)
+        # Flip to True once _execute_layered_step is implemented (milestone V2).
+        self._layered_prefill_v2_ready = False
+        self.layered_prefill_state = LayeredPrefillStateStore()
+        self.layered_prefill_model_adapter = None
+        self._layered_input_buffers: AscendInputBuffers | None = None
+        if self._layered_prefill_enabled:
+            # Phase 1 schedules a single P request; size by max query tokens.
+            # Keep max_num_reqs aligned with the main runner so query_start_loc
+            # padding helpers stay valid if the scheduler grows past k=1.
+            self._layered_input_buffers = AscendInputBuffers(
+                max_num_reqs=self.max_num_reqs,
+                max_num_tokens=self.max_num_tokens,
+                device=self.device,
+            )
+
         # we need to copy num_computed_tokens back to cpu to help
         # update actual seq_lens_cpu. gpu attention backend doesn't need these
         # attributes, cause their attention backends doesn't use seq_lens_cpu.
@@ -162,6 +184,25 @@ class NPUModelRunner(GPUModelRunner):
         set_mc2_mask(vllm_config, self.device)
         set_potential_max_tokens(vllm_config)
 
+    @contextmanager
+    def _layered_p_buffers(self):
+        """Swap in the P-only AscendInputBuffers for the Prefill sub-batch.
+
+        Must not fork prepare_inputs: that path hard-codes self.input_buffers.
+        D always uses the main buffers; P runs under this context (eager only).
+        """
+        if self._layered_input_buffers is None:
+            raise RuntimeError(
+                "Layered Prefill P buffers were not allocated; "
+                "enable layered_prefill_config before constructing NPUModelRunner"
+            )
+        main = self.input_buffers
+        self.input_buffers = self._layered_input_buffers
+        try:
+            yield
+        finally:
+            self.input_buffers = main
+
     def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
         with graph_manager_wrapper(self):
             super().initialize_kv_cache(kv_cache_config)
@@ -182,6 +223,14 @@ class NPUModelRunner(GPUModelRunner):
         is_profile: bool = False,
         context_len: int = 0,
     ):
+        layered_plan = getattr(scheduler_output, "layered_prefill_plan", None)
+        if layered_plan is not None and not dummy_run:
+            if not self._layered_prefill_v2_ready:
+                raise NotImplementedError(
+                    "layered_prefill_config on Model Runner V2 is not "
+                    "implemented yet (buffer isolation is in place; dual "
+                    "sub-batch orchestration is pending)"
+                )
         if vllm_version_is("0.27.1"):
             return super().execute_model(
                 scheduler_output,
