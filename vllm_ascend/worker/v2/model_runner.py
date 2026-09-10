@@ -18,6 +18,7 @@
 #
 
 from contextlib import contextmanager
+import os
 
 import numpy as np
 import torch
@@ -47,7 +48,8 @@ from vllm.v1.worker.gpu.async_utils import AsyncOutput
 from vllm.v1.worker.gpu.dp_utils import dispatch_cg_and_sync_dp
 from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
 from vllm.v1.worker.gpu.cudagraph_utils import get_uniform_token_count
-from vllm.forward_context import BatchDescriptor, set_forward_context
+from vllm.model_executor.models.utils import extract_layer_index
+from vllm.forward_context import BatchDescriptor, get_forward_context, set_forward_context
 
 from vllm_ascend.worker.v2.layered_prefill import (
     LayeredV2ExecuteModelState,
@@ -67,6 +69,9 @@ from vllm_ascend.ascend_forward_context import (
 )
 from vllm_ascend.ops.rotary_embedding import set_cos_and_sin, update_cos_sin
 from vllm_ascend.utils import set_potential_max_tokens, vllm_version_is
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
 
 if not vllm_version_is("0.27.1"):
     from vllm.v1.worker.gpu.model_runner import BatchReqState
@@ -422,6 +427,40 @@ class NPUModelRunner(GPUModelRunner):
                 self.req_states.num_computed_tokens_np[req_index]
             )
 
+    @staticmethod
+    def _layered_prefill_moe_layer_offset(
+        all_moe_layers: list[str], layer_start: int
+    ) -> int:
+        """Return the MoE custom-op layer offset for a Transformer layer boundary."""
+        return sum(
+            extract_layer_index(layer_name) < layer_start
+            for layer_name in all_moe_layers
+        )
+
+    def _set_layered_prefill_moe_layer_offset(self, layer_start: int) -> None:
+        forward_context = get_forward_context()
+        all_moe_layers = forward_context.all_moe_layers
+        # Empty list means the compile inventory was never filled; treat as unset
+        # so MoE ops fall back to baking layer names rather than indexing [].
+        if not all_moe_layers:
+            return
+        offset = self._layered_prefill_moe_layer_offset(all_moe_layers, layer_start)
+        forward_context.moe_layer_index = offset
+        # Optional cross-rank / debug ledger (V5). Enable with
+        # VLLM_ASCEND_LAYERED_MOE_LOG=1.
+        if os.environ.get("VLLM_ASCEND_LAYERED_MOE_LOG") == "1":
+            from vllm_ascend.ascend_forward_context import _EXTRA_CTX
+
+            logger.info(
+                "layered_moe plan group_start=%s moe_offset=%s/%s "
+                "comm=%s num_tokens=%s",
+                layer_start,
+                offset,
+                len(all_moe_layers),
+                getattr(_EXTRA_CTX, "moe_comm_type", None),
+                getattr(_EXTRA_CTX, "num_tokens", None),
+            )
+
     def _run_layered_prefill_subbatch(
         self,
         scheduler_output: SchedulerOutput,
@@ -513,6 +552,7 @@ class NPUModelRunner(GPUModelRunner):
             skip_compiled=True,
             is_padding=input_batch.is_padding,
         ):
+            self._set_layered_prefill_moe_layer_offset(layered_plan.group_start)
             self.kv_connector.pre_forward(scheduler_output)
 
             if layered_plan.group_id > 0:
