@@ -245,9 +245,9 @@ class NPUModelRunner(GPUModelRunner):
         if layered_plan is not None and not dummy_run:
             if not self._layered_prefill_v2_ready:
                 raise NotImplementedError(
-                    "layered_prefill_config on Model Runner V2 is not "
-                    "implemented yet (buffer isolation is in place; dual "
-                    "sub-batch orchestration is pending)"
+                    "layered_prefill_config on Model Runner V2 is not ready: "
+                    "load_model did not enable the PP=1 D→P path "
+                    "(PP>1 remains unimplemented)"
                 )
             return self._execute_layered_step(
                 scheduler_output,
@@ -356,6 +356,17 @@ class NPUModelRunner(GPUModelRunner):
             self.execute_model_state = None
             if d_state is None:
                 raise RuntimeError("Layered Prefill V2 D sub-batch missing execute state")
+            d_cg = CUDAGraphMode.NONE
+            try:
+                runtime_mode = get_forward_context().cudagraph_runtime_mode
+                if runtime_mode is not None:
+                    d_cg = runtime_mode
+            except Exception:
+                pass
+            logger.info_once(
+                "Layered Decode subbatch selected cudagraph_mode=%s",
+                d_cg.name,
+            )
             if p_req_ids:
                 # P reuses model activation scratch; keep D logits inputs alive.
                 d_state = detach_execute_model_state(d_state)
@@ -491,6 +502,7 @@ class NPUModelRunner(GPUModelRunner):
                 "Layered Prefill P sub-batch must stay eager "
                 f"(got cudagraph mode {batch_desc.cg_mode})"
             )
+        logger.info_once("Layered Prefill subbatch selected eager execution")
         if batch_desc.num_tokens == 0:
             raise RuntimeError("Layered Prefill P sub-batch dispatched zero tokens")
         if batch_desc.num_tokens != num_toks:

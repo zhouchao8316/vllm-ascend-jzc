@@ -84,7 +84,7 @@ def test_execute_model_fails_closed_when_layered_plan_present():
     runner._layered_prefill_v2_ready = False
     scheduler_output = SimpleNamespace(layered_prefill_plan=object())
 
-    with pytest.raises(NotImplementedError, match="not implemented yet"):
+    with pytest.raises(NotImplementedError, match="not ready"):
         NPUModelRunner.execute_model(runner, scheduler_output)
 
 

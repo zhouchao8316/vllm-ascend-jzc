@@ -204,8 +204,9 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
             # Keep pcp_world_size in this patched constructor for compatibility
             # with the upstream coordinator interface. PCP is rejected by the platform.
             del pcp_world_size
-            # main (cdc4824a21): upstream cache_blocks reads num_reprefillable_tokens
-            self.num_reprefillable_tokens = max(0, num_prefill_lookahead - 1)
+            # main (cdc4824a21): upstream cache_blocks reads num_reprefillable_tokens.
+            # Scheduler may pass None (DSpark / no lookahead); treat as 0.
+            self.num_reprefillable_tokens = max(0, (num_prefill_lookahead or 0) - 1)
             self.dcp_world_size = dcp_world_size
             self.scheduler_block_size = scheduler_block_size
             self.kv_cache_config = kv_cache_config
