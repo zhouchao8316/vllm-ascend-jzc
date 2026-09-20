@@ -305,6 +305,60 @@ class TestNPUPlatform(TestBase):
         # Must not raise — V2 + layered is deferred to the runner.
         _check_ascend_config(vllm_config, ascend_config)
 
+    def _layered_platform_config(self, *, use_v2: bool, async_sched: bool, prefix: bool):
+        vllm_config = self.mock_vllm_config()
+        vllm_config.use_v2_model_runner = use_v2
+        vllm_config.parallel_config.tensor_parallel_size = 1
+        vllm_config.parallel_config.pipeline_parallel_size = 1
+        vllm_config.parallel_config.data_parallel_size = 1
+        vllm_config.parallel_config.enable_dbo = False
+        vllm_config.parallel_config.enable_eplb = False
+        vllm_config.parallel_config.use_sequence_parallel_moe = False
+        vllm_config.model_config.architectures = ["Qwen3MoeForCausalLM"]
+        vllm_config.model_config.enforce_eager = True
+        vllm_config.model_config.is_multimodal = False
+        vllm_config.model_config.is_multimodal_model = False
+        vllm_config.model_config.enable_return_routed_experts = False
+        vllm_config.model_config.hf_text_config = SimpleNamespace(
+            model_type="qwen3_moe", num_hidden_layers=48
+        )
+        vllm_config.lora_config = None
+        vllm_config.compilation_config.mode = CompilationMode.NONE
+        vllm_config.compilation_config.cudagraph_mode = CUDAGraphMode.NONE
+        vllm_config.scheduler_config.async_scheduling = async_sched
+        vllm_config.cache_config.enable_prefix_caching = prefix
+        vllm_config.cache_config.kv_offloading_size = None
+        vllm_config.cache_config.mamba_cache_mode = "none"
+        ascend_config = self.mock_vllm_ascend_config()
+        ascend_config.scheduler_config.layered_prefill_config = SimpleNamespace(
+            enabled=True, require_eager=True
+        )
+        ascend_config.sparse_kv_offload_config.enabled = False
+        ascend_config.eplb_config.dynamic_eplb = False
+        ascend_config.enable_prefill_mc2 = False
+        ascend_config.multistream_overlap_shared_expert = False
+        return vllm_config, ascend_config
+
+    def test_layered_prefill_v2_allows_prefix_cache_and_async(self):
+        vllm_config, ascend_config = self._layered_platform_config(
+            use_v2=True, async_sched=True, prefix=True
+        )
+        _check_ascend_config(vllm_config, ascend_config)
+
+    def test_layered_prefill_v1_rejects_prefix_cache(self):
+        vllm_config, ascend_config = self._layered_platform_config(
+            use_v2=False, async_sched=False, prefix=True
+        )
+        with pytest.raises(ValueError, match="prefix caching"):
+            _check_ascend_config(vllm_config, ascend_config)
+
+    def test_layered_prefill_v1_rejects_async_scheduling(self):
+        vllm_config, ascend_config = self._layered_platform_config(
+            use_v2=False, async_sched=True, prefix=False
+        )
+        with pytest.raises(ValueError, match="async_scheduling"):
+            _check_ascend_config(vllm_config, ascend_config)
+
     def test_get_recompute_scheduler_cls(self):
         from vllm_ascend import platform
 

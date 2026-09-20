@@ -656,6 +656,16 @@ class NPUWorker(WorkerBase):
         if self.profiler is not None:
             self.profiler.step()
 
+        plan = getattr(scheduler_output, "layered_prefill_plan", None)
+        if plan is not None:
+            logger.info(
+                "NPUWorker received layered plan group=%s/%s enabled=%s ready=%s",
+                getattr(plan, "group_id", None),
+                getattr(plan, "num_groups", None),
+                getattr(self.model_runner, "_layered_prefill_enabled", None),
+                getattr(self.model_runner, "_layered_prefill_v2_ready", None),
+            )
+
         output = self.model_runner.execute_model(scheduler_output, intermediate_tensors)
         if isinstance(output, (ModelRunnerOutput, AsyncModelRunnerOutput, NoneType)):
             return output
@@ -689,6 +699,21 @@ class NPUWorker(WorkerBase):
         output = copy.copy(EMPTY_MODEL_RUNNER_OUTPUT)
         output.kv_connector_output = kv_connector_output
         return output
+
+    def layered_prefill_snapshot(self) -> dict[str, Any]:
+        runner = getattr(self, "model_runner", None)
+        snap = getattr(runner, "layered_prefill_snapshot", None)
+        if callable(snap):
+            return snap()
+        return {"error": "model_runner has no layered_prefill_snapshot"}
+
+    def reset_layered_prefill_counters(self) -> bool:
+        runner = getattr(self, "model_runner", None)
+        reset = getattr(runner, "reset_layered_prefill_counters", None)
+        if callable(reset):
+            reset()
+            return True
+        return False
 
     @torch.inference_mode()
     def sample_tokens(self, grammar_output: "GrammarOutput") -> ModelRunnerOutput | AsyncModelRunnerOutput:

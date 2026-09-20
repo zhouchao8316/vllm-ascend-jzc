@@ -8,7 +8,11 @@ See /home/jzc/gjc/layered_prefill_v2_migration_plan.md §§3–4.
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
+
+import numpy as np
+import torch
 
 from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
 from vllm.v1.worker.gpu.model_runner import ExecuteModelState
@@ -17,12 +21,23 @@ if TYPE_CHECKING:
     from vllm.v1.core.layered_prefill import LayeredPrefillPlan
 
 
+def empty_layered_prefill_counters() -> dict[str, Any]:
+    return {
+        "execute_steps": 0,
+        "transport_frontier_steps": 0,
+        "groups": [],
+        "pp_slots": [],
+        "activation_sources": [],
+    }
+
+
 @dataclass
 class LayeredV2ExecuteModelState:
     """Combined D/P execute state handed to sample_tokens.
 
     ``sample_p`` is False for intermediate layer groups so the worker skips
-    sampler / ``postprocess_num_computed_tokens`` for the P rows (plan §3.3).
+    sampler, ``postprocess_num_computed_tokens``, and the PPHandler slot for
+    the P rows (plan §3.3 / V6).  Final-P shares that one slot with D.
     """
 
     scheduler_output: SchedulerOutput
@@ -178,3 +193,253 @@ def split_d_p_req_ids(
         raise RuntimeError("Layered plan contains an unscheduled P request")
     d_req_ids = [req_id for req_id in all_req_ids if req_id not in p_req_set]
     return d_req_ids, p_req_ids
+
+
+def snapshot_pp_input_batch(input_batch) -> SimpleNamespace:
+    """Copy the fields ``PPHandler`` reads so a later P sample cannot alias them."""
+    num_reqs = int(input_batch.num_reqs)
+    max_seq = getattr(input_batch, "max_seq_len_np", None)
+    return SimpleNamespace(
+        req_ids=list(input_batch.req_ids)[:num_reqs],
+        num_reqs=num_reqs,
+        num_computed_tokens_np=np.array(
+            input_batch.num_computed_tokens_np[:num_reqs], copy=True
+        ),
+        prefill_len_np=np.array(input_batch.prefill_len_np[:num_reqs], copy=True),
+        max_seq_len_np=(
+            None if max_seq is None else np.array(max_seq[:num_reqs], copy=True)
+        ),
+        num_scheduled_tokens=np.array(
+            input_batch.num_scheduled_tokens[:num_reqs], copy=True
+        ),
+        idx_mapping=input_batch.idx_mapping[:num_reqs].detach().clone(),
+        idx_mapping_np=np.array(input_batch.idx_mapping_np[:num_reqs], copy=True),
+    )
+
+
+def concat_pp_input_batches(batches: list) -> SimpleNamespace:
+    """Stack D then P along the request axis for one PPHandler slot."""
+    if not batches:
+        raise RuntimeError("Layered PP merge received no input batches")
+    if len(batches) == 1:
+        return batches[0]
+
+    def _cat_np(attr: str) -> np.ndarray:
+        return np.concatenate(
+            [getattr(batch, attr)[: batch.num_reqs] for batch in batches]
+        )
+
+    max_seq_parts = [batch.max_seq_len_np for batch in batches]
+    if any(part is None for part in max_seq_parts):
+        max_seq = None
+    else:
+        max_seq = np.concatenate(
+            [part[: batch.num_reqs] for part, batch in zip(max_seq_parts, batches)]
+        )
+    return SimpleNamespace(
+        req_ids=[
+            req_id
+            for batch in batches
+            for req_id in list(batch.req_ids)[: batch.num_reqs]
+        ],
+        num_reqs=sum(batch.num_reqs for batch in batches),
+        num_computed_tokens_np=_cat_np("num_computed_tokens_np"),
+        prefill_len_np=_cat_np("prefill_len_np"),
+        max_seq_len_np=max_seq,
+        num_scheduled_tokens=_cat_np("num_scheduled_tokens"),
+        idx_mapping=torch.cat(
+            [batch.idx_mapping[: batch.num_reqs] for batch in batches], dim=0
+        ),
+        idx_mapping_np=_cat_np("idx_mapping_np"),
+    )
+
+
+def compute_layered_need_sampled_mask(
+    input_batch,
+    *,
+    sample_p: bool,
+    p_req_ids: set[str] | frozenset[str] | None = None,
+) -> np.ndarray | None:
+    """Upstream mask plus layered-aware exclusion of intermediate P rows.
+
+    ``PPHandler.compute_need_sampled_mask`` treats ``old_computed=0`` and
+    ``num_scheduled == prefill_len`` as a final prefill.  Every layered
+    intermediate group looks like that, so those rows must not occupy the
+    sampled-token slot (migration plan §4 V6).
+    """
+    from vllm.v1.worker.gpu.pp_utils import compute_need_sampled_mask
+
+    mask = compute_need_sampled_mask(input_batch)
+    if mask is None:
+        return None
+    mask = np.array(mask, copy=True)
+    if not sample_p and p_req_ids:
+        for index, req_id in enumerate(list(input_batch.req_ids)[: input_batch.num_reqs]):
+            if req_id in p_req_ids:
+                mask[index] = False
+    return mask if mask.any() else None
+
+
+def _is_p_only_batch(batch, p_req_ids: set[str]) -> bool:
+    if not p_req_ids:
+        return False
+    return set(batch.req_ids[: batch.num_reqs]).issubset(p_req_ids)
+
+
+def _pp_flush_stats(
+    *,
+    role: str,
+    sample_p: bool,
+    kept: list,
+    dropped: list,
+    p_ids: set[str],
+) -> dict[str, Any]:
+    def _rows(batches: list) -> tuple[int, int]:
+        n_d = 0
+        n_p = 0
+        for batch in batches:
+            n_req = int(batch.num_reqs)
+            if _is_p_only_batch(batch, p_ids):
+                n_p += n_req
+            else:
+                n_d += n_req
+        return n_d, n_p
+
+    n_d, n_p = _rows(kept)
+    dropped_d, dropped_p = _rows(dropped)
+    req_ids = [
+        req_id
+        for batch in kept
+        for req_id in list(batch.req_ids)[: batch.num_reqs]
+    ]
+    return {
+        "role": role,
+        "sample_p": bool(sample_p),
+        "n_d": n_d,
+        "n_p": n_p,
+        "dropped_p_rows": dropped_p,
+        "dropped_d_rows": dropped_d,
+        "req_ids": req_ids,
+        "skipped": not kept,
+    }
+
+
+def _pad_sampled_tokens(tokens: torch.Tensor, width: int) -> torch.Tensor:
+    if tokens.ndim == 1:
+        tokens = tokens.unsqueeze(1)
+    if tokens.shape[1] == width:
+        return tokens
+    if tokens.shape[1] > width:
+        return tokens[:, :width]
+    pad = tokens.new_full((tokens.shape[0], width - tokens.shape[1]), -1)
+    return torch.cat((tokens, pad), dim=1)
+
+
+class LayeredPPHandlerCapture:
+    """Capture D/P ``broadcast``/``receive`` and flush them as one PPHandler slot.
+
+    ``PPHandler.queue`` holds one entry per scheduler step.  Sampling D then
+    the final P group would overwrite that entry unless the two sub-batches
+    share a single NCCL payload (concatenated along the request axis).
+    Intermediate P groups are dropped: they must not produce a sample.
+    """
+
+    def __init__(self, inner):
+        self.inner = inner
+        self.broadcasts: list[tuple] = []
+        self.receives: list = []
+
+    def __getattr__(self, name):
+        return getattr(self.inner, name)
+
+    def broadcast(
+        self,
+        sampled_token_ids: torch.Tensor,
+        num_sampled: torch.Tensor | None,
+        num_rejected: torch.Tensor | None,
+        input_batch,
+    ) -> None:
+        snapshot = snapshot_pp_input_batch(input_batch)
+        num_reqs = snapshot.num_reqs
+        device = sampled_token_ids.device
+        tokens = sampled_token_ids[:num_reqs].detach().clone()
+        if num_sampled is None:
+            sampled = torch.zeros(num_reqs, dtype=torch.int32, device=device)
+        else:
+            sampled = num_sampled[:num_reqs].detach().clone()
+        if num_rejected is None:
+            rejected = torch.zeros(num_reqs, dtype=sampled.dtype, device=sampled.device)
+        else:
+            rejected = num_rejected[:num_reqs].detach().clone()
+        self.broadcasts.append((tokens, sampled, rejected, snapshot))
+
+    def receive(self, input_batch) -> bool:
+        # Always False: D and P are flushed together, so neither sub-batch
+        # can claim "all rows decode next" until the merged mask is known.
+        # Default model_state.postprocess_state is a no-op for int 0.
+        self.receives.append(snapshot_pp_input_batch(input_batch))
+        return False
+
+    def flush(
+        self,
+        *,
+        sample_p: bool,
+        p_req_ids: set[str] | frozenset[str] | None = None,
+    ) -> dict[str, Any]:
+        p_ids = set(p_req_ids or ())
+        inner = self.inner
+        if getattr(inner, "is_last_rank", False):
+            dropped = [
+                payload
+                for payload in self.broadcasts
+                if not sample_p and _is_p_only_batch(payload[3], p_ids)
+            ]
+            payloads = [
+                payload
+                for payload in self.broadcasts
+                if sample_p or not _is_p_only_batch(payload[3], p_ids)
+            ]
+            stats = _pp_flush_stats(
+                role="broadcast",
+                sample_p=sample_p,
+                kept=[payload[3] for payload in payloads],
+                dropped=[payload[3] for payload in dropped],
+                p_ids=p_ids,
+            )
+            if not payloads:
+                return stats
+            width = int(getattr(inner, "max_sample_len", payloads[0][0].shape[-1] or 1))
+            tokens = torch.cat(
+                [_pad_sampled_tokens(payload[0], width) for payload in payloads],
+                dim=0,
+            )
+            num_sampled = torch.cat([payload[1] for payload in payloads], dim=0)
+            num_rejected = torch.cat([payload[2] for payload in payloads], dim=0)
+            inner.broadcast(
+                tokens,
+                num_sampled,
+                num_rejected,
+                concat_pp_input_batches([payload[3] for payload in payloads]),
+            )
+            return stats
+        dropped = [
+            batch
+            for batch in self.receives
+            if not sample_p and _is_p_only_batch(batch, p_ids)
+        ]
+        batches = [
+            batch
+            for batch in self.receives
+            if sample_p or not _is_p_only_batch(batch, p_ids)
+        ]
+        stats = _pp_flush_stats(
+            role="receive",
+            sample_p=sample_p,
+            kept=batches,
+            dropped=dropped,
+            p_ids=p_ids,
+        )
+        if not batches:
+            return stats
+        inner.receive(concat_pp_input_batches(batches))
+        return stats
