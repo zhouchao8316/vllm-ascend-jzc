@@ -124,3 +124,114 @@ def test_layered_v2_state_sample_p_flag():
     )
     assert state.sample_p is False
     assert isinstance(state.scheduler_output, SchedulerOutput)
+
+
+def test_pad_for_sequence_parallelism_rounds_up_when_dsa_cp(monkeypatch):
+    from types import SimpleNamespace
+
+    runner = NPUModelRunner.__new__(NPUModelRunner)
+    runner.vllm_config = SimpleNamespace(
+        parallel_config=SimpleNamespace(tensor_parallel_size=8)
+    )
+    monkeypatch.setattr(
+        "vllm_ascend.worker.v2.model_runner.enable_dsa_cp", lambda: True
+    )
+    monkeypatch.setattr(
+        "vllm_ascend.worker.v2.model_runner.enable_sp", lambda *args, **kwargs: False
+    )
+    assert runner._pad_for_sequence_parallelism(4100) == 4104
+    assert runner._pad_for_sequence_parallelism(4104) == 4104
+
+
+def test_pad_for_sequence_parallelism_noop_without_dsa_cp(monkeypatch):
+    from types import SimpleNamespace
+
+    runner = NPUModelRunner.__new__(NPUModelRunner)
+    runner.vllm_config = SimpleNamespace(
+        parallel_config=SimpleNamespace(tensor_parallel_size=8)
+    )
+    monkeypatch.setattr(
+        "vllm_ascend.worker.v2.model_runner.enable_dsa_cp", lambda: False
+    )
+    monkeypatch.setattr(
+        "vllm_ascend.worker.v2.model_runner.enable_sp", lambda *args, **kwargs: False
+    )
+    assert runner._pad_for_sequence_parallelism(4100) == 4100
+
+
+def test_worker_layered_probe_info_rpc_shape():
+    from types import SimpleNamespace
+
+    from vllm_ascend.worker.worker import NPUWorker
+
+    runner = SimpleNamespace(
+        _layered_prefill_enabled=True,
+        _layered_prefill_v2_ready=True,
+        _layered_input_buffers=object(),
+        layered_prefill_model_adapter=object(),
+        vllm_config=SimpleNamespace(
+            model_config=SimpleNamespace(enforce_eager=False),
+            compilation_config=SimpleNamespace(cudagraph_mode="FULL_DECODE_ONLY"),
+        ),
+    )
+    worker = NPUWorker.__new__(NPUWorker)
+    worker.rank = 0
+    worker.is_driver_worker = True
+    worker.use_v2_model_runner = True
+    worker.model_runner = runner
+
+    info = worker.get_layered_prefill_probe_info()
+    assert info["ok"] is True
+    assert info["layered_v2_ready"] is True
+    assert info["layered_adapter"] is True
+    assert info["runner_class"].endswith("SimpleNamespace")
+
+
+def test_prepare_attn_splits_actual_and_padded_input(monkeypatch):
+    from types import SimpleNamespace
+
+    import numpy as np
+    from vllm.config.compilation import CUDAGraphMode
+
+    from vllm_ascend.worker.v2.model_states.default import AscendModelState
+
+    captured: dict = {}
+
+    def fake_build_attn_metadata(**kwargs):
+        captured.update(kwargs)
+        return {"ok": True}
+
+    monkeypatch.setattr(
+        "vllm_ascend.worker.v2.model_states.default.build_attn_metadata",
+        fake_build_attn_metadata,
+    )
+    state = AscendModelState.__new__(AscendModelState)
+    state.max_model_len = 8192
+    input_batch = SimpleNamespace(
+        num_reqs=1,
+        num_reqs_after_padding=1,
+        num_tokens=4100,
+        num_tokens_after_padding=4104,
+        query_start_loc_np=np.array([0, 4100], dtype=np.int32),
+        query_start_loc=object(),
+        is_prefilling_np=np.array([True]),
+        num_scheduled_tokens=np.array([4100], dtype=np.int32),
+        seq_lens=object(),
+        seq_lens_np=np.array([4100], dtype=np.int32),
+        positions=object(),
+        attn_state=None,
+        dcp_local_seq_lens=None,
+    )
+    metadata = state.prepare_attn(
+        input_batch,
+        CUDAGraphMode.NONE,
+        block_tables=(),
+        slot_mappings=object(),
+        attn_groups=[],
+        kv_cache_config=object(),
+        num_input_tokens=4104,
+    )
+    assert metadata == {"ok": True}
+    assert captured["num_actual_tokens"] == 4100
+    assert captured["num_input_tokens"] == 4104
+    assert captured["num_tokens"] == 4104

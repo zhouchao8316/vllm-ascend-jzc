@@ -345,12 +345,12 @@ class TestNPUPlatform(TestBase):
         )
         _check_ascend_config(vllm_config, ascend_config)
 
-    def test_layered_prefill_v1_rejects_prefix_cache(self):
+    def test_layered_prefill_v1_allows_prefix_cache(self):
+        # origin/layer_prefill: prefix cache is allowed on V1 as well.
         vllm_config, ascend_config = self._layered_platform_config(
             use_v2=False, async_sched=False, prefix=True
         )
-        with pytest.raises(ValueError, match="prefix caching"):
-            _check_ascend_config(vllm_config, ascend_config)
+        _check_ascend_config(vllm_config, ascend_config)
 
     def test_layered_prefill_v1_rejects_async_scheduling(self):
         vllm_config, ascend_config = self._layered_platform_config(

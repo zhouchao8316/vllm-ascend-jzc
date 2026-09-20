@@ -849,6 +849,41 @@ class NPUWorker(WorkerBase):
         c = torch.rand((4, 4), dtype=torch.float32).npu()
         torch_npu._npu_matmul_add_fp32(x, weight, c)
 
+    def get_layered_prefill_probe_info(self) -> dict:
+        """Collect V2 layered runner flags (works under TP multiprocess RPC)."""
+        runner = getattr(self, "model_runner", None)
+        if runner is None:
+            return {"ok": False, "rank": self.rank, "error": "model_runner missing"}
+        runner_cls = type(runner)
+        vllm_config = getattr(runner, "vllm_config", None)
+        model_config = getattr(vllm_config, "model_config", None) if vllm_config else None
+        compilation_config = (
+            getattr(vllm_config, "compilation_config", None) if vllm_config else None
+        )
+        return {
+            "ok": True,
+            "rank": self.rank,
+            "is_driver_worker": bool(getattr(self, "is_driver_worker", False)),
+            "use_v2_model_runner": bool(self.use_v2_model_runner),
+            "runner_class": f"{runner_cls.__module__}.{runner_cls.__name__}",
+            "layered_enabled": bool(
+                getattr(runner, "_layered_prefill_enabled", False)
+            ),
+            "layered_v2_ready": bool(
+                getattr(runner, "_layered_prefill_v2_ready", False)
+            ),
+            "layered_buffers": getattr(runner, "_layered_input_buffers", None)
+            is not None,
+            "layered_adapter": getattr(runner, "layered_prefill_model_adapter", None)
+            is not None,
+            "runner_cudagraph_mode": str(
+                getattr(compilation_config, "cudagraph_mode", None)
+            ),
+            "runner_enforce_eager": bool(
+                getattr(model_config, "enforce_eager", False) if model_config else False
+            ),
+        }
+
     def get_model(self) -> nn.Module:
         return self.model_runner.get_model()
 

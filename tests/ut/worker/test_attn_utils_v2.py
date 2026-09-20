@@ -183,11 +183,17 @@ class _RecordingDSAMetadataBuilder(AscendDSAMetadataBuilder):
         call = {
             "common_attn_metadata": common_attn_metadata,
             "common_ratio_to_sas_metadata": self.common_ratio_to_sas_metadata,
+            "num_reqs_actual": kwargs.get("num_reqs_actual"),
         }
         assert "block_size" not in kwargs
         self.calls.append(call)
         call["common_ratio_to_sas_metadata"].setdefault("first_group", len(self.calls) == 1)
         return SimpleNamespace(common_attn_metadata=common_attn_metadata)
+
+    def build_for_cudagraph_capture(self, common_attn_metadata):
+        raise AssertionError(
+            "DSA capture must call build() with common_ratio_to_sas_metadata"
+        )
 
 
 def _make_dsa_metadata_groups():
@@ -381,3 +387,64 @@ def test_mrv2_builds_shared_dsa_metadata_for_each_execution_mode(
     cache_name = "common_ratio_to_sas_metadata"
     assert calls[0][cache_name] is calls[1][cache_name]
     assert calls[1][cache_name]["first_group"] is True
+    expected_actual = 2
+    for call in calls:
+        assert call["num_reqs_actual"] == expected_actual
+
+
+def test_build_attn_metadata_zeros_fullgraph_padding_seq_lens():
+    layer_names, _specs, calls, attn_groups, kv_cache_config = _make_dsa_metadata_groups()
+    seq_lens = torch.tensor([17, 4096], dtype=torch.int32)
+    seq_lens_np = np.array([17, 4096], dtype=np.int32)
+    attn_utils.build_attn_metadata(
+        attn_groups=attn_groups,
+        num_reqs=2,
+        num_reqs_actual=1,
+        num_tokens=8,
+        query_start_loc_gpu=torch.tensor([0, 1, 8], dtype=torch.int32),
+        query_start_loc_cpu=torch.tensor([0, 1, 8], dtype=torch.int32),
+        max_query_len=7,
+        seq_lens=seq_lens,
+        max_seq_len=16392,
+        block_tables=(
+            torch.zeros((2, 1), dtype=torch.int32),
+            torch.zeros((2, 1), dtype=torch.int32),
+        ),
+        slot_mappings=torch.zeros((2, 8), dtype=torch.int32),
+        kv_cache_config=kv_cache_config,
+        seq_lens_np=seq_lens_np,
+        positions=torch.arange(8, dtype=torch.int32),
+    )
+    assert torch.equal(seq_lens, torch.tensor([17, 0], dtype=torch.int32))
+    assert seq_lens_np[1] == 0
+    for call in calls:
+        assert call["num_reqs_actual"] == 1
+        assert call["common_attn_metadata"].num_reqs == 2
+
+
+def test_mrv2_cudagraph_capture_uses_dsa_build_not_capture_helper():
+    """DSV4 FULL_DECODE_ONLY capture must not skip common_ratio_to_sas_metadata."""
+    layer_names, _specs, calls, attn_groups, kv_cache_config = _make_dsa_metadata_groups()
+    metadata = attn_utils.build_attn_metadata(
+        attn_groups=attn_groups,
+        num_reqs=1,
+        num_tokens=1,
+        query_start_loc_gpu=torch.tensor([0, 1], dtype=torch.int32),
+        query_start_loc_cpu=torch.tensor([0, 1], dtype=torch.int32),
+        max_query_len=1,
+        seq_lens=torch.tensor([1], dtype=torch.int32),
+        max_seq_len=8,
+        block_tables=(
+            torch.zeros((1, 1), dtype=torch.int32),
+            torch.zeros((1, 1), dtype=torch.int32),
+        ),
+        slot_mappings=torch.zeros((2, 1), dtype=torch.int32),
+        kv_cache_config=kv_cache_config,
+        seq_lens_np=np.array([1], dtype=np.int32),
+        positions=torch.arange(1, dtype=torch.int32),
+        for_cudagraph_capture=True,
+    )
+    assert set(metadata) == set(layer_names)
+    assert len(calls) == 2
+    for call in calls:
+        assert isinstance(call["common_ratio_to_sas_metadata"], dict)

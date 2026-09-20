@@ -520,8 +520,8 @@ if vllm_version_is("0.27.1"):
         # compatibility; platform validation guarantees that it is one.
         del pcp_world_size
         token_budget = _select_kv_token_budget(max_model_len, max_in_flight_tokens, max_num_batched_tokens)
-        if num_prefill_lookahead is None:
-            num_prefill_lookahead = 0
+        # 0.27.1 has no num_prefill_lookahead; do not copy the newer-branch
+        # None-check (that was UnboundLocalError on every engine init).
         if _is_deepseek_v4_kv_cache_config(kv_cache_config):
             return AscendHybridKVCacheCoordinator(
                 kv_cache_config,

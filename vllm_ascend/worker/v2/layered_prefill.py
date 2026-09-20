@@ -35,9 +35,11 @@ def empty_layered_prefill_counters() -> dict[str, Any]:
 class LayeredV2ExecuteModelState:
     """Combined D/P execute state handed to sample_tokens.
 
-    ``sample_p`` is False for intermediate layer groups so the worker skips
-    sampler, ``postprocess_num_computed_tokens``, and the PPHandler slot for
-    the P rows (plan §3.3 / V6).  Final-P shares that one slot with D.
+    ``sample_p`` is True only on ``LayeredPrefillPlan.is_sampling_step``
+    (final layer group of the final prompt chunk). Intermediate groups and
+    non-final chunks skip sampler, ``postprocess_num_computed_tokens``, and
+    the PPHandler slot for the P rows (plan §3.3 / V6).  Final-P shares that
+    one slot with D.
     """
 
     scheduler_output: SchedulerOutput

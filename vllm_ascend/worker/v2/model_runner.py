@@ -18,6 +18,7 @@
 #
 
 from contextlib import contextmanager
+from dataclasses import replace
 import os
 
 import numpy as np
@@ -27,6 +28,7 @@ from vllm.config.compilation import CompilationMode, CUDAGraphMode
 from vllm.distributed.parallel_state import get_pp_group
 from vllm.distributed.utils import get_pp_indices
 from vllm.sequence import IntermediateTensors
+from vllm.utils.math_utils import round_up
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.gpu import model_runner as vllm_model_runner
@@ -55,7 +57,7 @@ from vllm.v1.worker.gpu.dp_utils import dispatch_cg_and_sync_dp
 from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
 from vllm.v1.worker.gpu.cudagraph_utils import get_uniform_token_count
 from vllm.model_executor.models.utils import extract_layer_index
-from vllm.forward_context import BatchDescriptor, get_forward_context, set_forward_context
+from vllm.forward_context import BatchDescriptor, get_forward_context
 
 from vllm_ascend.worker.v2.layered_prefill import (
     LayeredPPHandlerCapture,
@@ -72,11 +74,17 @@ from vllm_ascend.ascend_forward_context import (
     get_mc2_tokens_capacity,
     override_mrv2_in_profile_run,
     select_moe_comm_method,
+    set_ascend_forward_context,
     set_mc2_mask,
     set_mc2_tokens_capacity,
 )
 from vllm_ascend.ops.rotary_embedding import set_cos_and_sin, update_cos_sin
-from vllm_ascend.utils import set_potential_max_tokens, vllm_version_is
+from vllm_ascend.utils import (
+    enable_dsa_cp,
+    enable_sp,
+    set_potential_max_tokens,
+    vllm_version_is,
+)
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
@@ -378,7 +386,7 @@ class NPUModelRunner(GPUModelRunner):
         )
         logger.info(
             "Layered Prefill V2 step group=%s/%s layers=[%s,%s) "
-            "n_d=%s n_p=%s final=%s pp=%s",
+            "n_d=%s n_p=%s final_group=%s sampling=%s pp=%s",
             layered_plan.group_id,
             layered_plan.num_groups,
             layered_plan.group_start,
@@ -386,6 +394,7 @@ class NPUModelRunner(GPUModelRunner):
             len(d_req_ids),
             len(p_req_ids),
             bool(layered_plan.is_final_group),
+            bool(getattr(layered_plan, "is_sampling_step", layered_plan.is_final_group)),
             int(self.parallel_config.pipeline_parallel_size),
         )
         if use_pp and not self.is_first_pp_rank and d_req_ids and d_intermediate is None:
@@ -487,7 +496,9 @@ class NPUModelRunner(GPUModelRunner):
                 scheduler_output=scheduler_output,
                 d_state=d_state,
                 p_state=p_state,
-                sample_p=bool(layered_plan.is_final_group),
+                sample_p=bool(
+                    getattr(layered_plan, "is_sampling_step", layered_plan.is_final_group)
+                ),
             )
             if use_pp and not self.is_last_pp_rank:
                 d_pp = pp_intermediates[0] if d_req_ids else None
@@ -552,6 +563,10 @@ class NPUModelRunner(GPUModelRunner):
                 "group_start": int(layered_plan.group_start),
                 "group_end": int(layered_plan.group_end),
                 "is_final": bool(layered_plan.is_final_group),
+                "is_sampling_step": bool(
+                    getattr(layered_plan, "is_sampling_step", layered_plan.is_final_group)
+                ),
+                "is_final_chunk": bool(getattr(layered_plan, "is_final_chunk", True)),
                 "n_d": int(n_d),
                 "n_p": int(n_p),
                 "cached_tokens": int(
@@ -875,6 +890,17 @@ class NPUModelRunner(GPUModelRunner):
                 getattr(_EXTRA_CTX, "num_tokens", None),
             )
 
+    def _pad_for_sequence_parallelism(self, num_scheduled_tokens: int) -> int:
+        """Pad query tokens to a TP multiple when DSA-CP or native SP is on.
+
+        Same contract as V1 ``NPUModelRunner._pad_for_sequence_parallelism``:
+        scheduler bookkeeping stays on the logical length.
+        """
+        tp_size = self.vllm_config.parallel_config.tensor_parallel_size
+        if enable_sp(self.vllm_config) or enable_dsa_cp():
+            return round_up(num_scheduled_tokens, tp_size)
+        return num_scheduled_tokens
+
     def _run_layered_prefill_subbatch(
         self,
         scheduler_output: SchedulerOutput,
@@ -909,10 +935,14 @@ class NPUModelRunner(GPUModelRunner):
         logger.info_once("Layered Prefill subbatch selected eager execution")
         if batch_desc.num_tokens == 0:
             raise RuntimeError("Layered Prefill P sub-batch dispatched zero tokens")
-        if batch_desc.num_tokens != num_toks:
-            raise RuntimeError(
-                "Layered prefill Phase 1 does not support padded eager batches"
-            )
+        # Match V1 / origin dsa_cp: pad the physical eager batch to a TP
+        # multiple while scheduler_output keeps the logical prompt length.
+        # KV/attention use the logical count; MoE collectives use the padded
+        # width. Pad rows get slot_id=-1 (compute_slot_mappings) and zeroed
+        # positions.
+        padded_toks = self._pad_for_sequence_parallelism(num_toks)
+        if padded_toks != batch_desc.num_tokens:
+            batch_desc = replace(batch_desc, num_tokens=padded_toks)
 
         if not vllm_version_is("0.27.1"):
             raise NotImplementedError(
@@ -921,6 +951,15 @@ class NPUModelRunner(GPUModelRunner):
             )
 
         input_batch = self.prepare_inputs(scheduler_output, batch_desc)
+        if padded_toks != input_batch.num_tokens_after_padding:
+            raise RuntimeError(
+                "Layered Prefill P pad width mismatch: batch_desc="
+                f"{padded_toks}, input_batch={input_batch.num_tokens_after_padding}"
+            )
+        if input_batch.num_tokens_after_padding > input_batch.num_tokens:
+            pad_from = input_batch.num_tokens
+            pad_to = input_batch.num_tokens_after_padding
+            self.input_buffers.positions[pad_from:pad_to].fill_(0)
         block_tables, slot_mappings = self.prepare_attn(input_batch)
         self.model_state.preprocess_state(
             input_batch,
@@ -940,6 +979,7 @@ class NPUModelRunner(GPUModelRunner):
             self.attn_groups,
             self.kv_cache_config,
             for_capture=False,
+            num_input_tokens=padded_toks if padded_toks > num_toks else None,
         )
 
         input_ids = input_batch.input_ids
@@ -968,17 +1008,21 @@ class NPUModelRunner(GPUModelRunner):
         )
         self._record_layered_activation(layered_plan, activation_source)
 
-        with set_forward_context(
+        with set_ascend_forward_context(
             attn_metadata,
             self.vllm_config,
             num_tokens=num_tokens_padded,
-            cudagraph_runtime_mode=batch_desc.cg_mode,
             num_tokens_across_dp=num_tokens_across_dp,
+            num_actual_tokens=num_toks,
+            aclgraph_runtime_mode=batch_desc.cg_mode,
             batch_descriptor=batch_descriptor,
-            slot_mapping=slot_mappings_by_layer,
+            model_instance=self.model,
             skip_compiled=True,
-            is_padding=input_batch.is_padding,
+            moe_comm_token_count=num_toks,
         ):
+            ctx = get_forward_context()
+            ctx.slot_mapping = slot_mappings_by_layer
+            ctx.is_padding = input_batch.is_padding
             self._set_layered_prefill_moe_layer_offset(layered_plan.group_start)
             self.kv_connector.pre_forward(scheduler_output)
 
@@ -1087,10 +1131,11 @@ class NPUModelRunner(GPUModelRunner):
                             )
                         outputs.append(output)
                     else:
-                        # Intermediate group: skip sampler, token-progress
-                        # append, and the PPHandler slot.  Still emit req_ids
-                        # so scheduler.update_from_output can find every
-                        # scheduled request (empty sampled tokens).
+                        # Non-sampling step (intermediate layer group, or the
+                        # last group of a non-final prompt chunk): skip sampler,
+                        # token-progress append, and the PPHandler slot.  Still
+                        # emit req_ids so scheduler.update_from_output can find
+                        # every scheduled request (empty sampled tokens).
                         finished = state.p_state.finished_req_ids
                         self.execute_model_state = None
                         kv_out = self.kv_connector.post_forward(finished)
@@ -1195,6 +1240,11 @@ class NPUModelRunner(GPUModelRunner):
             num_tokens = scheduler_output.total_num_scheduled_tokens
             num_tokens_after_padding = batch_desc.num_tokens
             assert num_tokens > 0
+            if num_tokens_after_padding > num_tokens:
+                self.input_buffers.is_padding[:num_tokens].fill_(False)
+                self.input_buffers.is_padding[num_tokens:num_tokens_after_padding].fill_(
+                    True
+                )
             num_tokens_per_req = scheduler_output.num_scheduled_tokens
             num_reqs = len(num_tokens_per_req)
 
@@ -1310,7 +1360,10 @@ class NPUModelRunner(GPUModelRunner):
             )
             seq_lens = self.input_buffers.seq_lens[:num_reqs_padded]
 
-            # Pad for full CUDA graph mode.
+            # Pad for full CUDA graph mode.  Also clear FIA dummy rows
+            # [num_reqs, num_reqs_padded) so DSA-CP does not inherit leftover KV
+            # lengths (see AscendDSACPMetadataBuilder._zero_graph_padding_rows).
+            self.input_buffers.seq_lens_np[num_reqs:num_reqs_padded] = 0
             self.input_buffers.seq_lens_np[num_reqs_padded:] = 0
 
             # Some input token ids are directly read from the last sampled tokens
@@ -1408,6 +1461,11 @@ class NPUModelRunner(GPUModelRunner):
             num_tokens = scheduler_output.total_num_scheduled_tokens
             num_tokens_after_padding = batch_desc.num_tokens
             assert num_tokens > 0
+            if num_tokens_after_padding > num_tokens:
+                self.input_buffers.is_padding[:num_tokens].fill_(False)
+                self.input_buffers.is_padding[num_tokens:num_tokens_after_padding].fill_(
+                    True
+                )
             num_tokens_per_req = scheduler_output.num_scheduled_tokens
             num_reqs = len(num_tokens_per_req)
 
@@ -1527,7 +1585,10 @@ class NPUModelRunner(GPUModelRunner):
             )
             seq_lens = self.input_buffers.seq_lens[:num_reqs_padded]
 
-            # Pad for full CUDA graph mode.
+            # Pad for full CUDA graph mode.  Also clear FIA dummy rows
+            # [num_reqs, num_reqs_padded) so DSA-CP does not inherit leftover KV
+            # lengths (see AscendDSACPMetadataBuilder._zero_graph_padding_rows).
+            self.input_buffers.seq_lens_np[num_reqs:num_reqs_padded] = 0
             self.input_buffers.seq_lens_np[num_reqs_padded:] = 0
 
             # Some input token ids are directly read from the last sampled tokens
@@ -1674,6 +1735,10 @@ class NPUModelRunner(GPUModelRunner):
             req_index = self.req_states.req_id_to_index[req_id]
             num_computed_tokens = self.req_states.num_computed_tokens_cpu[req_index]
             self.input_buffers.seq_lens_cpu[i] = num_computed_tokens + num_scheduled_tokens[req_id]
+        # Dummy FULL-graph / FIA pad rows must not keep the previous step's length.
+        cpu_seq = self.input_buffers.seq_lens_cpu
+        if len(req_ids) < len(cpu_seq):
+            cpu_seq[len(req_ids) :] = 0
 
     def _pad_query_start_loc_for_fia(
         self,
