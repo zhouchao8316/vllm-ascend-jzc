@@ -18,6 +18,39 @@ vLLM Ascend Plugin
 </p>
 
 ---
+
+## 本仓库：Model Runner V2 + Layered Prefill
+
+本仓库基于 [`gjc0824/vllm-ascend`](https://github.com/gjc0824/vllm-ascend) 的 `layer_prefill` 分支，在 **Model Runner V2** 上接上 layered prefill（原先 platform 会直接拒绝 V2 + layered）。相对上游 `layer_prefill`，本仓库多做了这些事：
+
+1. **放开 V2 门禁**：去掉 “layered 只能走 V1 runner” 的硬拒绝；layered 仍默认关。
+2. **Decode / Prefill 子批**：给 Prefill 单独的 `AscendInputBuffers`，同一步先 D 后 P（Ascend `attn_metadata` 是实例状态，顺序是正确性约束），合并 sampling。
+3. **MoE 层偏移**：P 子批只跑 `[group_start, group_end)`，把 MoE 库存起始偏移写进 `forward_context.moe_layer_index`，避免每个 group 都从 0 取错 per-layer 状态。
+4. **hybrid KV**：`num_prefill_lookahead is None` 按 0 处理；并记录 D/P 实际使用的 cudagraph 模式。
+5. **V2 上允许 prefix cache / async scheduling**（仍可用开关关掉；下面实验关掉了这两项以便对照）。
+6. **ACL 507011 修复**：`FULL_DECODE_ONLY` 会给 FIA 填 dummy 行。DSA-CP 必须用真实 `num_reqs`，并把 padding 行的 `seq_lens` / block table 清零，否则 MTE 越界。该修复后 FDO 路径可跑 layered。
+
+主要代码：[`vllm_ascend/worker/v2/model_runner.py`](vllm_ascend/worker/v2/model_runner.py)、[`layered_prefill.py`](vllm_ascend/worker/v2/layered_prefill.py)、[`attn_utils.py`](vllm_ascend/worker/v2/attn_utils.py)、[`dsa_cp.py`](vllm_ascend/attention/context_parallel/dsa_cp.py)。
+
+### 实验数据（2026-09-20，FDO 修好后）
+
+- **机型**：8× Ascend 910B3，容器内 `vllm serve`
+- **模型**：DeepSeek-V4 Flash W8A8（`--quantization ascend`，`--tokenizer-mode deepseek_v4`）
+- **并行**：TP=8，EP on，DP=1，PP=1，V2 runner（`VLLM_USE_V2_MODEL_RUNNER=1`）
+- **图模式**：`cudagraph_mode=FULL_DECODE_ONLY`（含上述 507011 修复）
+- **压测**：aisbench GSM8K stream，**in=4096 / out=256 / n=16 / concurrency=8**，prefix cache 关、async 关
+- **对照**：chunked prefill（`max_num_batched_tokens=256`）vs layered G=8（`allowed_num_groups=[8]`，`max_num_batched_tokens=16392`）；两臂 `max_num_seqs=8`
+
+| 臂 | 状态 | TTFT avg (ms) | TPOT avg (ms) | E2EL avg (ms) | 输出吞吐 (tok/s) |
+|---|:---:|---:|---:|---:|---:|
+| chunked MBT=256 | 16/16 成功 | 11726.4 | 114.2 | 40844.7 | 48.6 |
+| layered G=8 | 16/16 成功 | 2488.9 | 56.2 | 16832.6 | 117.1 |
+
+layered G=8 相对 chunked：TTFT 约 **4.7×**，TPOT **−58.0 ms**，E2EL 约 **2.4×**，输出吞吐约 **2.4×**。两臂 0 次 507011。这是单次 pass（n=16），不是 overnight 多 G sweep。
+
+已知限制：PP>1 的 V2 layered 仍在补；`max_num_seqs>1` 时个别 prompt 与 layered-off baseline 的中段 token 可能不一致，单请求 TP=2 可逐 token 对齐。
+
+---
 *最新消息* 🔥
 
 - [2026/08] 我们发布了新的正式版本 [v0.23.0](https://github.com/vllm-project/vllm-ascend/releases/tag/v0.23.0)! 请按照[官方指南](https://docs.vllm.ai/projects/ascend/en/v0.23.0/)开始在 Ascend 上部署 vLLM Ascend Plugin。

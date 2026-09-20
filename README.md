@@ -24,6 +24,39 @@ vLLM Ascend Plugin
 </p>
 
 ---
+
+## This fork: Model Runner V2 + Layered Prefill
+
+This tree is based on [`gjc0824/vllm-ascend`](https://github.com/gjc0824/vllm-ascend) `layer_prefill`, and wires **layered prefill onto Model Runner V2** (upstream used to hard-reject V2 + layered). On top of that branch this fork adds:
+
+1. **V2 platform gate**: drop the “layered requires the V1 runner” check. Layered stays default-off.
+2. **Decode / Prefill sub-batches**: a second `AscendInputBuffers` for Prefill; run D then P in the same step (Ascend keeps `attn_metadata` as instance state); merge sampling.
+3. **MoE layer offset**: a P sub-batch only runs `[group_start, group_end)`; write the MoE inventory offset into `forward_context.moe_layer_index` so groups do not index from zero.
+4. **Hybrid KV**: treat `num_prefill_lookahead is None` as 0; log the CUDAGraph mode actually used by D and P.
+5. **Prefix cache / async scheduling allowed on V2** (the numbers below turn both off for a clean compare).
+6. **ACL 507011 fix**: `FULL_DECODE_ONLY` pads dummy FIA rows. DSA-CP must use the real `num_reqs` and zero padded `seq_lens` / block tables, or MTE reads out of range. After this, FDO + layered works.
+
+Main files: [`vllm_ascend/worker/v2/model_runner.py`](vllm_ascend/worker/v2/model_runner.py), [`layered_prefill.py`](vllm_ascend/worker/v2/layered_prefill.py), [`attn_utils.py`](vllm_ascend/worker/v2/attn_utils.py), [`dsa_cp.py`](vllm_ascend/attention/context_parallel/dsa_cp.py).
+
+### Numbers (2026-09-20, after the FDO fix)
+
+- **Host**: 8× Ascend 910B3, `vllm serve` in container
+- **Model**: DeepSeek-V4 Flash W8A8 (`--quantization ascend`, `--tokenizer-mode deepseek_v4`)
+- **Parallelism**: TP=8, EP on, DP=1, PP=1, V2 runner (`VLLM_USE_V2_MODEL_RUNNER=1`)
+- **Graph**: `cudagraph_mode=FULL_DECODE_ONLY` (with the 507011 fix above)
+- **Bench**: aisbench GSM8K stream, **in=4096 / out=256 / n=16 / concurrency=8**; prefix cache off, async off
+- **Arms**: chunked prefill (`max_num_batched_tokens=256`) vs layered G=8 (`allowed_num_groups=[8]`, `max_num_batched_tokens=16392`); both `max_num_seqs=8`
+
+| Arm | Status | TTFT avg (ms) | TPOT avg (ms) | E2EL avg (ms) | Output tok/s |
+|---|:---:|---:|---:|---:|---:|
+| chunked MBT=256 | 16/16 ok | 11726.4 | 114.2 | 40844.7 | 48.6 |
+| layered G=8 | 16/16 ok | 2488.9 | 56.2 | 16832.6 | 117.1 |
+
+Layered G=8 vs chunked: TTFT about **4.7×**, TPOT **−58.0 ms**, E2EL about **2.4×**, output throughput about **2.4×**. Zero 507011 faults on either arm. One pass (n=16), not a multi-G overnight sweep.
+
+Limits: V2 layered PP>1 is still incomplete; with `max_num_seqs>1` a mid-sequence token can diverge from the layered-off baseline, while single-request TP=2 matches token-for-token.
+
+---
 *Latest News* 🔥
 
 - [2026/08] We released the new official version [v0.23.0](https://github.com/vllm-project/vllm-ascend/releases/tag/v0.23.0)! Please follow the [official guide](https://docs.vllm.ai/projects/ascend/en/v0.23.0/) to start using vLLM Ascend Plugin on Ascend.
