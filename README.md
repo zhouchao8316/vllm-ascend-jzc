@@ -27,34 +27,58 @@ vLLM Ascend Plugin
 
 ## This fork: Model Runner V2 + Layered Prefill
 
-This tree is based on [`gjc0824/vllm-ascend`](https://github.com/gjc0824/vllm-ascend) `layer_prefill`, and wires **layered prefill onto Model Runner V2** (upstream used to hard-reject V2 + layered). On top of that branch this fork adds:
+Based on [`gjc0824/vllm-ascend`](https://github.com/gjc0824/vllm-ascend) `layer_prefill`. Layered prefill on Model Runner V2; the original branch rejected that combination.
 
-1. **V2 platform gate**: drop the “layered requires the V1 runner” check. Layered stays default-off.
-2. **Decode / Prefill sub-batches**: a second `AscendInputBuffers` for Prefill; run D then P in the same step (Ascend keeps `attn_metadata` as instance state); merge sampling.
-3. **MoE layer offset**: a P sub-batch only runs `[group_start, group_end)`; write the MoE inventory offset into `forward_context.moe_layer_index` so groups do not index from zero.
-4. **Hybrid KV**: treat `num_prefill_lookahead is None` as 0; log the CUDAGraph mode actually used by D and P.
-5. **Prefix cache / async scheduling allowed on V2** (the numbers below turn both off for a clean compare).
-6. **ACL 507011 fix**: `FULL_DECODE_ONLY` pads dummy FIA rows. DSA-CP must use the real `num_reqs` and zero padded `seq_lens` / block tables, or MTE reads out of range. After this, FDO + layered works.
+1. **V2 platform gate**: drop the V1-only check. Layered remains default-off.
+2. **D/P sub-batches**: a separate `AscendInputBuffers` for Prefill; D then P in one step (`attn_metadata` is instance state); merge sampling.
+3. **MoE layer offset**: P runs `[group_start, group_end)`; write the offset to `forward_context.moe_layer_index`.
+4. **Hybrid KV**: `num_prefill_lookahead is None` is treated as 0. Log the CUDAGraph mode used by D and P.
+5. **Prefix cache and async scheduling** are allowed on V2 (off in the numbers below).
+6. **ACL 507011**: `FULL_DECODE_ONLY` pads dummy FIA rows. DSA-CP must use the real `num_reqs` and zero padded `seq_lens` / block tables; otherwise MTE reads out of range.
+7. **PP>1**: one recv/send per scheduler step; D/P rows in one `IntermediateTensors` payload; sampled tokens share one PPHandler slot (intermediate P groups excluded). Layer groups must align with PP stages.
 
-Main files: [`vllm_ascend/worker/v2/model_runner.py`](vllm_ascend/worker/v2/model_runner.py), [`layered_prefill.py`](vllm_ascend/worker/v2/layered_prefill.py), [`attn_utils.py`](vllm_ascend/worker/v2/attn_utils.py), [`dsa_cp.py`](vllm_ascend/attention/context_parallel/dsa_cp.py).
+Code: [`vllm_ascend/worker/v2/model_runner.py`](vllm_ascend/worker/v2/model_runner.py), [`layered_prefill.py`](vllm_ascend/worker/v2/layered_prefill.py), [`attn_utils.py`](vllm_ascend/worker/v2/attn_utils.py), [`dsa_cp.py`](vllm_ascend/attention/context_parallel/dsa_cp.py).
 
-### Numbers (2026-09-20, after the FDO fix)
+### DSV4-Flash, TP=8, PP=1 (2026-09-20)
 
-- **Host**: 8× Ascend 910B3, `vllm serve` in container
-- **Model**: DeepSeek-V4 Flash W8A8 (`--quantization ascend`, `--tokenizer-mode deepseek_v4`)
-- **Parallelism**: TP=8, EP on, DP=1, PP=1, V2 runner (`VLLM_USE_V2_MODEL_RUNNER=1`)
-- **Graph**: `cudagraph_mode=FULL_DECODE_ONLY` (with the 507011 fix above)
-- **Bench**: aisbench GSM8K stream, **in=4096 / out=256 / n=16 / concurrency=8**; prefix cache off, async off
-- **Arms**: chunked prefill (`max_num_batched_tokens=256`) vs layered G=8 (`allowed_num_groups=[8]`, `max_num_batched_tokens=16392`); both `max_num_seqs=8`
+- Host: 8× Ascend 910B3
+- Model: DeepSeek-V4 Flash W8A8 (`--quantization ascend`, `--tokenizer-mode deepseek_v4`)
+- Parallel: TP=8, EP, DP=1, PP=1, `VLLM_USE_V2_MODEL_RUNNER=1`
+- Graph: `cudagraph_mode=FULL_DECODE_ONLY`
+- Bench: aisbench GSM8K stream, in=4096 / out=256 / n=16 / concurrency=8; prefix cache off, async off
+- Setups: chunked (MBT=256, 512) vs layered G=8 (`allowed_num_groups=[8]`, `max_num_batched_tokens=16392`); `max_num_seqs=8`. On a 4k prompt, MBT=512 and G=8 are both ~8 prefill steps; MBT=256 is ~16. G=8 is a single earlier run, reused for the 512 compare.
 
-| Arm | Status | TTFT avg (ms) | TPOT avg (ms) | E2EL avg (ms) | Output tok/s |
+| Setup | Requests | TTFT avg (ms) | TPOT avg (ms) | E2EL avg (ms) | Output tok/s |
 |---|:---:|---:|---:|---:|---:|
-| chunked MBT=256 | 16/16 ok | 11726.4 | 114.2 | 40844.7 | 48.6 |
-| layered G=8 | 16/16 ok | 2488.9 | 56.2 | 16832.6 | 117.1 |
+| chunked MBT=256 | 16/16 | 11726.4 | 114.2 | 40844.7 | 48.6 |
+| chunked MBT=512 | 16/16 | 6848.3 | 85.7 | 28694.7 | 69.8 |
+| layered G=8 | 16/16 (reused) | 2488.9 | 56.2 | 16832.6 | 117.1 |
 
-Layered G=8 vs chunked: TTFT about **4.7×**, TPOT **−58.0 ms**, E2EL about **2.4×**, output throughput about **2.4×**. Zero 507011 faults on either arm. One pass (n=16), not a multi-G overnight sweep.
+Vs chunked MBT=512 (same step count): G=8 TTFT ≈ 2.8×, TPOT −29.5 ms, E2EL and throughput ≈ 1.7×. MBT=256 uses twice as many steps and is not an iso-step baseline. One pass; no ACL 507011.
 
-Limits: V2 layered PP>1 is still incomplete; with `max_num_seqs>1` a mid-sequence token can diverge from the layered-off baseline, while single-request TP=2 matches token-for-token.
+### Pipeline parallel
+
+`PP>1` is accepted with V2 layered. Prefill groups stay eager; Decode may use `FULL_DECODE_ONLY`. Still rejected: DP>1, DBO, SP, EPLB, PCP/DCP (`context_parallel_size>1`), KV offload.
+
+Qwen3-30B-A3B, V2, TP=1:
+
+| Config | Test | Date | Result |
+|---|---|---|---|
+| PP=2 | LLM smoke (P-only, mixed P+D, frontier) | 2026-09-17, 09-18 | pass |
+| PP=4 | LLM smoke, including 4-hop frontier | 2026-09-17 | pass |
+| PP=4 | aisbench in=4096 / out=256 / n=32 / c=8 | 2026-09-17 | chunked, layered G=1, layered G=4 completed |
+
+| Setup | TTFT avg (ms) | TPOT avg (ms) | Output tok/s |
+|---|---:|---:|---:|
+| chunked | 1060.0 | 33.8 | 211.1 |
+| layered G=1 | 1322.1 | 42.4 | 166.6 |
+| layered G=4 | 1319.3 | 39.8 | 177.0 |
+
+Layered G=4: `mix_frac=1.0`, 124 layered steps. V1 has restricted-text checks for PP=2/4 and TP=2+PP=2+EP=2 (eager; Decode graph + Prefill eager).
+
+2026-09-20, cards 4–7, Qwen3-30B-A3B V2 PP=2 TP=2, `cudagraph_mode=FULL_DECODE_ONLY`, `max_num_seqs=1`, four greedy prompts: layered G=2 matched the FDO baseline token-for-token, and matched the earlier eager PP=2 TP=2 baseline. Graph capture succeeded; no ACL 507011. Mixed P+D under FDO was not in this pass.
+
+The DSV4-Flash TP8+EP table is PP=1. DSV4 with PP=2/4 was not run. Not covered: bubble time, cancel/preempt/finish, logits/KV. On PP=4, Prefill tokens can differ between graph and eager (also without layered). With `max_num_seqs>1`, a mid-sequence token may differ from layered-off; a single request at TP=2 matches token-for-token.
 
 ---
 *Latest News* 🔥

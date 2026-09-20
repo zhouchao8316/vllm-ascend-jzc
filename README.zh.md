@@ -21,34 +21,58 @@ vLLM Ascend Plugin
 
 ## 本仓库：Model Runner V2 + Layered Prefill
 
-本仓库基于 [`gjc0824/vllm-ascend`](https://github.com/gjc0824/vllm-ascend) 的 `layer_prefill` 分支，在 **Model Runner V2** 上接上 layered prefill（原先 platform 会直接拒绝 V2 + layered）。相对上游 `layer_prefill`，本仓库多做了这些事：
+基于 [`gjc0824/vllm-ascend`](https://github.com/gjc0824/vllm-ascend) `layer_prefill`。在 Model Runner V2 上启用 layered prefill；原分支拒绝该组合。
 
-1. **放开 V2 门禁**：去掉 “layered 只能走 V1 runner” 的硬拒绝；layered 仍默认关。
-2. **Decode / Prefill 子批**：给 Prefill 单独的 `AscendInputBuffers`，同一步先 D 后 P（Ascend `attn_metadata` 是实例状态，顺序是正确性约束），合并 sampling。
-3. **MoE 层偏移**：P 子批只跑 `[group_start, group_end)`，把 MoE 库存起始偏移写进 `forward_context.moe_layer_index`，避免每个 group 都从 0 取错 per-layer 状态。
-4. **hybrid KV**：`num_prefill_lookahead is None` 按 0 处理；并记录 D/P 实际使用的 cudagraph 模式。
-5. **V2 上允许 prefix cache / async scheduling**（仍可用开关关掉；下面实验关掉了这两项以便对照）。
-6. **ACL 507011 修复**：`FULL_DECODE_ONLY` 会给 FIA 填 dummy 行。DSA-CP 必须用真实 `num_reqs`，并把 padding 行的 `seq_lens` / block table 清零，否则 MTE 越界。该修复后 FDO 路径可跑 layered。
+1. **V2 门禁**：去掉仅允许 V1 runner 的检查。layered 默认关闭。
+2. **D/P 子批**：Prefill 使用独立 `AscendInputBuffers`；同一步先 D 后 P（`attn_metadata` 为实例状态）；合并 sampling。
+3. **MoE 层偏移**：P 执行 `[group_start, group_end)`，将偏移写入 `forward_context.moe_layer_index`。
+4. **hybrid KV**：`num_prefill_lookahead is None` 视为 0；记录 D/P 实际使用的 CUDAGraph 模式。
+5. **V2 允许 prefix cache 与 async scheduling**（下表实验均关闭）。
+6. **ACL 507011**：`FULL_DECODE_ONLY` 会为 FIA 填充 dummy 行。DSA-CP 须使用真实 `num_reqs`，并将 padding 行的 `seq_lens` / block table 置零，否则 MTE 越界。
+7. **PP>1**：每个 scheduler step 一收一发；D/P 行放入同一 `IntermediateTensors`；采样共用一个 PPHandler（中间 P group 不采样）。layer group 须与 PP stage 对齐。
 
-主要代码：[`vllm_ascend/worker/v2/model_runner.py`](vllm_ascend/worker/v2/model_runner.py)、[`layered_prefill.py`](vllm_ascend/worker/v2/layered_prefill.py)、[`attn_utils.py`](vllm_ascend/worker/v2/attn_utils.py)、[`dsa_cp.py`](vllm_ascend/attention/context_parallel/dsa_cp.py)。
+代码：[`vllm_ascend/worker/v2/model_runner.py`](vllm_ascend/worker/v2/model_runner.py)、[`layered_prefill.py`](vllm_ascend/worker/v2/layered_prefill.py)、[`attn_utils.py`](vllm_ascend/worker/v2/attn_utils.py)、[`dsa_cp.py`](vllm_ascend/attention/context_parallel/dsa_cp.py)。
 
-### 实验数据（2026-09-20，FDO 修好后）
+### DSV4-Flash，TP=8，PP=1（2026-09-20）
 
-- **机型**：8× Ascend 910B3，容器内 `vllm serve`
-- **模型**：DeepSeek-V4 Flash W8A8（`--quantization ascend`，`--tokenizer-mode deepseek_v4`）
-- **并行**：TP=8，EP on，DP=1，PP=1，V2 runner（`VLLM_USE_V2_MODEL_RUNNER=1`）
-- **图模式**：`cudagraph_mode=FULL_DECODE_ONLY`（含上述 507011 修复）
-- **压测**：aisbench GSM8K stream，**in=4096 / out=256 / n=16 / concurrency=8**，prefix cache 关、async 关
-- **对照**：chunked prefill（`max_num_batched_tokens=256`）vs layered G=8（`allowed_num_groups=[8]`，`max_num_batched_tokens=16392`）；两臂 `max_num_seqs=8`
+- 机型：8× Ascend 910B3
+- 模型：DeepSeek-V4 Flash W8A8（`--quantization ascend`，`--tokenizer-mode deepseek_v4`）
+- 并行：TP=8，EP，DP=1，PP=1，`VLLM_USE_V2_MODEL_RUNNER=1`
+- 图模式：`cudagraph_mode=FULL_DECODE_ONLY`
+- 压测：aisbench GSM8K stream，in=4096 / out=256 / n=16 / concurrency=8；prefix cache 关，async 关
+- 实验组：chunked（MBT=256、512）vs layered G=8（`allowed_num_groups=[8]`，`max_num_batched_tokens=16392`）；`max_num_seqs=8`。4k prompt 上 MBT=512 与 G=8 均为约 8 步 prefill；MBT=256 约 16 步。G=8 为单次测量，512 对照复用该结果。
 
-| 臂 | 状态 | TTFT avg (ms) | TPOT avg (ms) | E2EL avg (ms) | 输出吞吐 (tok/s) |
+| 实验组 | 请求 | TTFT avg (ms) | TPOT avg (ms) | E2EL avg (ms) | 输出吞吐 (tok/s) |
 |---|:---:|---:|---:|---:|---:|
-| chunked MBT=256 | 16/16 成功 | 11726.4 | 114.2 | 40844.7 | 48.6 |
-| layered G=8 | 16/16 成功 | 2488.9 | 56.2 | 16832.6 | 117.1 |
+| chunked MBT=256 | 16/16 | 11726.4 | 114.2 | 40844.7 | 48.6 |
+| chunked MBT=512 | 16/16 | 6848.3 | 85.7 | 28694.7 | 69.8 |
+| layered G=8 | 16/16（复用） | 2488.9 | 56.2 | 16832.6 | 117.1 |
 
-layered G=8 相对 chunked：TTFT 约 **4.7×**，TPOT **−58.0 ms**，E2EL 约 **2.4×**，输出吞吐约 **2.4×**。两臂 0 次 507011。这是单次 pass（n=16），不是 overnight 多 G sweep。
+相对 chunked MBT=512（等步）：G=8 TTFT ≈ 2.8×，TPOT −29.5 ms，E2EL 与吞吐 ≈ 1.7×。MBT=256 步数多一倍，不作等步对照。单次 pass；无 ACL 507011。
 
-已知限制：PP>1 的 V2 layered 仍在补；`max_num_seqs>1` 时个别 prompt 与 layered-off baseline 的中段 token 可能不一致，单请求 TP=2 可逐 token 对齐。
+### Pipeline parallel
+
+V2 layered 允许 `PP>1`。Prefill group 保持 eager；Decode 可用 `FULL_DECODE_ONLY`。仍拒绝：DP>1、DBO、SP、EPLB、PCP/DCP（`context_parallel_size>1`）、KV offload。
+
+Qwen3-30B-A3B，V2，TP=1：
+
+| 配置 | 测试 | 日期 | 结果 |
+|---|---|---|---|
+| PP=2 | LLM smoke（P-only、P+D 混合、frontier） | 2026-09-17、09-18 | 通过 |
+| PP=4 | LLM smoke，含 4-hop frontier | 2026-09-17 | 通过 |
+| PP=4 | aisbench in=4096 / out=256 / n=32 / c=8 | 2026-09-17 | chunked、layered G=1、layered G=4 完成 |
+
+| 实验组 | TTFT avg (ms) | TPOT avg (ms) | 输出吞吐 (tok/s) |
+|---|---:|---:|---:|
+| chunked | 1060.0 | 33.8 | 211.1 |
+| layered G=1 | 1322.1 | 42.4 | 166.6 |
+| layered G=4 | 1319.3 | 39.8 | 177.0 |
+
+layered G=4：`mix_frac=1.0`，124 个 layered step。V1 对 PP=2/4 与 TP=2+PP=2+EP=2 有受限文本核对（eager；Decode graph + Prefill eager）。
+
+2026-09-20，卡 4–7，Qwen3-30B-A3B V2 PP=2 TP=2，`cudagraph_mode=FULL_DECODE_ONLY`，`max_num_seqs=1`，4 条 greedy：layered G=2 与同模式 FDO baseline 逐 token 一致，也与此前 eager PP=2 TP=2 baseline 一致。graph capture 成功，无 ACL 507011。本次未覆盖 FDO 下的 P+D 混合。
+
+上表 DSV4-Flash TP8+EP 为 PP=1。DSV4 的 PP=2/4 未跑。未覆盖：bubble 时间、cancel/preempt/finish、logits/KV。PP=4 上 graph 与 eager 的 Prefill token 可能不一致（关闭 layered 时同样存在）。`max_num_seqs>1` 时，中段 token 可能与 layered-off 不一致；单请求 TP=2 可逐 token 对齐。
 
 ---
 *最新消息* 🔥
