@@ -498,13 +498,13 @@ def test_prepare_p_activation_rank_before_owner_uses_transport_frontier(monkeypa
         runner, plan, dummy_h, dummy_r = _pp4_activation_runner(
             monkeypatch, rank=rank, leftover=leftover
         )
-        req_id, frontier, embeds, inter, source = runner._prepare_layered_p_activation(
+        req_ids, frontier, embeds, inter, source = runner._prepare_layered_p_activation(
             plan,
             num_tokens_padded=3,
             inputs_embeds=torch.ones(3, 4),
             intermediate_tensors=received,
         )
-        assert req_id == "p0"
+        assert req_ids == ["p0"]
         assert source == "transport_frontier"
         assert frontier[0] is dummy_h
         assert frontier[1] is dummy_r
@@ -599,6 +599,73 @@ def test_prepare_p_activation_group0_rank0_uses_embed(monkeypatch):
     assert source == "embed"
     assert frontier is None
     assert embeds is embeds_in
+    assert inter is None
+
+
+def test_prepare_mixed_activation_non_owner_uses_pp_recv(monkeypatch):
+    runner, _plan, _h, _r = _pp4_activation_runner(monkeypatch, rank=1, leftover=None)
+    plan = SimpleNamespace(
+        prefill_req_ids=("p0",),
+        group_id=0,
+        group_start=0,
+        group_end=6,
+    )
+    received = IntermediateTensors({"hidden_states": torch.full((4, 4), 9.0)})
+    req_ids, frontier, embeds, inter, source = runner._prepare_layered_p_activation(
+        plan,
+        req_ids=["d0", "p0"],
+        num_tokens_padded=4,
+        inputs_embeds=torch.ones(4, 4),
+        intermediate_tensors=received,
+    )
+    assert req_ids == ["d0", "p0"]
+    assert source == "pp_recv"
+    assert frontier is None
+    assert embeds is None
+    assert inter is received
+
+
+def test_prepare_mixed_activation_owner_concats_frontiers(monkeypatch):
+    from vllm.v1.core.layered_prefill import LayeredFrontier, LayeredPrefillStateStore
+
+    runner, _plan, _h, _r = _pp4_activation_runner(monkeypatch, rank=0, leftover=None)
+    plan = SimpleNamespace(
+        prefill_req_ids=("p0",),
+        group_id=1,
+        group_start=6,
+        group_end=12,
+    )
+    store = LayeredPrefillStateStore()
+    store.put(
+        LayeredFrontier(
+            req_id="d0",
+            group_id=1,
+            query_len=1,
+            hidden_states=torch.ones(1, 4),
+            residual=None,
+        )
+    )
+    store.put(
+        LayeredFrontier(
+            req_id="p0",
+            group_id=1,
+            query_len=3,
+            hidden_states=torch.full((3, 4), 2.0),
+            residual=None,
+        )
+    )
+    runner.layered_prefill_state = store
+    req_ids, frontier, embeds, inter, source = runner._prepare_layered_p_activation(
+        plan,
+        req_ids=["d0", "p0"],
+        num_tokens_padded=5,
+        inputs_embeds=None,
+        intermediate_tensors=None,
+    )
+    assert req_ids == ["d0", "p0"]
+    assert source == "frontier_mixed"
+    assert frontier[0].shape == (5, 4)
+    assert embeds is None
     assert inter is None
 
 

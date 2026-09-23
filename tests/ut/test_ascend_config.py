@@ -1011,6 +1011,37 @@ class TestSchedulerConfig(TestBase):
         self.assertEqual(layered.group_token_target, 1024)
         self.assertEqual(layered.allowed_num_groups, (1, 2, 4))
         self.assertEqual(layered.max_groups_per_step, 1)
+        self.assertFalse(layered.fuse_mixed_batch)
+
+    def test_layered_prefill_config_parses_fuse_mixed_batch(self):
+        config = SchedulerConfig(
+            {
+                "scheduler_config": {
+                    "layered_prefill_config": {
+                        "enabled": True,
+                        "fuse_mixed_batch": True,
+                    }
+                }
+            },
+            balance_env_value=False,
+        )
+        self.assertTrue(config.layered_prefill_config.fuse_mixed_batch)
+
+    def test_layered_prefill_config_parses_same_layer_batch(self):
+        config = SchedulerConfig(
+            {
+                "scheduler_config": {
+                    "layered_prefill_config": {
+                        "enabled": True,
+                        "same_layer_batch": True,
+                        "p_group_decode_budget_ms": 80,
+                    }
+                }
+            },
+            balance_env_value=False,
+        )
+        self.assertTrue(config.layered_prefill_config.same_layer_batch)
+        self.assertEqual(config.layered_prefill_config.p_group_decode_budget_ms, 80.0)
 
     @patch("vllm_ascend.ascend_config.logger.warning_once")
     def test_none_config_uses_defaults_and_legacy_fallback(self, mock_warning_once):

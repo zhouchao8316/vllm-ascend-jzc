@@ -1225,6 +1225,11 @@ class SchedulerConfig:
             max_groups_per_step=int(layered_prefill_raw.get("max_groups_per_step", 1)),
             require_pd_mixed=bool(layered_prefill_raw.get("require_pd_mixed", True)),
             require_eager=bool(layered_prefill_raw.get("require_eager", True)),
+            fuse_mixed_batch=bool(layered_prefill_raw.get("fuse_mixed_batch", False)),
+            same_layer_batch=bool(layered_prefill_raw.get("same_layer_batch", False)),
+            p_group_decode_budget_ms=float(
+                layered_prefill_raw.get("p_group_decode_budget_ms", 0.0) or 0.0
+            ),
         )
 
     @staticmethod

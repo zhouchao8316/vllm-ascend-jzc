@@ -9,11 +9,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Sequence
 
 import numpy as np
 import torch
 
+from vllm.v1.core.layered_prefill import LayeredFrontier, LayeredPrefillStateStore
 from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
 from vllm.v1.worker.gpu.model_runner import ExecuteModelState
 
@@ -25,6 +26,8 @@ def empty_layered_prefill_counters() -> dict[str, Any]:
     return {
         "execute_steps": 0,
         "transport_frontier_steps": 0,
+        "fused_mixed_steps": 0,
+        "same_layer_steps": 0,
         "groups": [],
         "pp_slots": [],
         "activation_sources": [],
@@ -40,12 +43,17 @@ class LayeredV2ExecuteModelState:
     non-final chunks skip sampler, ``postprocess_num_computed_tokens``, and
     the PPHandler slot for the P rows (plan §3.3 / V6).  Final-P shares that
     one slot with D.
+
+    ``fused_mixed``: D+P ran as one eager layer-group forward. ``d_state`` is
+    None and ``p_state`` holds the combined batch. Sample the whole batch on
+    ``sample_p``; otherwise emit empty tokens for every mixed row.
     """
 
     scheduler_output: SchedulerOutput
     d_state: ExecuteModelState | None
     p_state: ExecuteModelState | None
     sample_p: bool
+    fused_mixed: bool = False
 
 
 def detach_execute_model_state(state: ExecuteModelState) -> ExecuteModelState:
@@ -445,3 +453,164 @@ class LayeredPPHandlerCapture:
             return stats
         inner.receive(concat_pp_input_batches(batches))
         return stats
+
+
+def concat_req_frontiers(
+    store: LayeredPrefillStateStore,
+    req_ids: Sequence[str],
+    *,
+    expected_group_id: int,
+    num_tokens_padded: int,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Concatenate per-request frontiers in input-batch order, then pad."""
+    if not req_ids:
+        raise RuntimeError("concat_req_frontiers requires at least one request")
+    hidden_parts: list[torch.Tensor] = []
+    residual_parts: list[torch.Tensor] = []
+    residual_mode: bool | None = None
+    for req_id in req_ids:
+        frontier = store.get(req_id)
+        if frontier is None:
+            raise RuntimeError(
+                f"Missing layered activation frontier for request {req_id}"
+            )
+        if frontier.group_id != expected_group_id:
+            raise RuntimeError(
+                f"Layered frontier group mismatch for {req_id}: expected "
+                f"{expected_group_id}, got {frontier.group_id}"
+            )
+        hidden_parts.append(frontier.hidden_states)
+        has_residual = frontier.residual is not None
+        if residual_mode is None:
+            residual_mode = has_residual
+        elif residual_mode != has_residual:
+            raise RuntimeError(
+                "Layered mixed frontiers mix residual and residual-free rows"
+            )
+        if has_residual:
+            residual_parts.append(frontier.residual)
+    hidden = torch.cat(hidden_parts, dim=0)
+    residual = torch.cat(residual_parts, dim=0) if residual_mode else None
+    pad = int(num_tokens_padded) - int(hidden.shape[0])
+    if pad < 0:
+        raise RuntimeError(
+            "Layered mixed frontier rows exceed the padded token width"
+        )
+    if pad > 0:
+        hidden = _pad_token_rows(hidden, pad)
+        if residual is not None:
+            residual = _pad_token_rows(residual, pad)
+    return hidden, residual
+
+
+def store_req_frontiers(
+    store: LayeredPrefillStateStore,
+    req_ids: Sequence[str],
+    query_start_loc: np.ndarray,
+    hidden_states: torch.Tensor,
+    residual: torch.Tensor | None,
+    next_group_id: int,
+    *,
+    batch_req_ids: Sequence[str] | None = None,
+    keep_ids: Sequence[str] | None = None,
+) -> None:
+    """Slice mixed hidden/residual back into per-request frontiers.
+
+    ``query_start_loc`` is always aligned to ``batch_req_ids`` (or ``req_ids``
+    when that is the full batch). ``keep_ids`` persists a subset without
+    treating subset order as loc indices.
+    """
+    loc_ids = list(batch_req_ids) if batch_req_ids is not None else list(req_ids)
+    persist = list(keep_ids) if keep_ids is not None else list(req_ids)
+    id_to_index = {req_id: index for index, req_id in enumerate(loc_ids)}
+    last_id = loc_ids[-1] if loc_ids else None
+    total_rows = int(hidden_states.shape[0])
+    if residual is not None and int(residual.shape[0]) != total_rows:
+        raise RuntimeError(
+            "Layered frontier hidden and residual row counts differ: "
+            f"hidden_rows={total_rows} residual_rows={int(residual.shape[0])}"
+        )
+    for req_id in persist:
+        if req_id not in id_to_index:
+            raise RuntimeError(
+                f"Layered frontier store missing {req_id} in batch {loc_ids}"
+            )
+        index = id_to_index[req_id]
+        start = int(query_start_loc[index])
+        end = int(query_start_loc[index + 1])
+        if end <= start:
+            raise RuntimeError(
+                f"Layered mixed frontier has empty rows for request {req_id}"
+            )
+        # Sequence-parallel / DSA-CP padding is appended after the last
+        # logical token and is already computed by this group. Keep it on
+        # the last request so the next group restores the physical width.
+        # query_len stays the logical token count.
+        row_end = total_rows if req_id == last_id and total_rows > end else end
+        store.put(
+            LayeredFrontier(
+                req_id=req_id,
+                group_id=next_group_id,
+                query_len=end - start,
+                hidden_states=hidden_states[start:row_end].clone(),
+                residual=(
+                    None if residual is None else residual[start:row_end].clone()
+                ),
+            )
+        )
+
+
+def slice_req_activations(
+    req_ids: Sequence[str],
+    keep_ids: Sequence[str],
+    query_start_loc: np.ndarray,
+    hidden_states: torch.Tensor,
+    residual: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Take hidden/residual rows for ``keep_ids`` in ``req_ids`` order."""
+    keep = set(keep_ids)
+    hidden_parts: list[torch.Tensor] = []
+    residual_parts: list[torch.Tensor] = []
+    for index, req_id in enumerate(req_ids):
+        if req_id not in keep:
+            continue
+        start = int(query_start_loc[index])
+        end = int(query_start_loc[index + 1])
+        if end <= start:
+            raise RuntimeError(
+                f"Layered activation slice is empty for request {req_id}"
+            )
+        hidden_parts.append(hidden_states[start:end].clone())
+        if residual is not None:
+            residual_parts.append(residual[start:end].clone())
+    if not hidden_parts:
+        raise RuntimeError("Layered activation slice matched no requests")
+    hidden = torch.cat(hidden_parts, dim=0)
+    residual_out = torch.cat(residual_parts, dim=0) if residual_parts else None
+    return hidden, residual_out
+
+
+def _pad_token_rows(tensor: torch.Tensor, pad: int) -> torch.Tensor:
+    """Pad dimension 0 (token rows). Feature dims, including DSV4 hc, stay put."""
+    if pad == 0:
+        return tensor
+    # F.pad lists (left, right) pairs from the last dimension backward.
+    spec = [0, 0] * tensor.dim()
+    spec[-1] = pad
+    return torch.nn.functional.pad(tensor, spec)
+
+
+def pad_activation_rows(
+    hidden_states: torch.Tensor,
+    residual: torch.Tensor | None,
+    num_tokens_padded: int,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    pad = int(num_tokens_padded) - int(hidden_states.shape[0])
+    if pad < 0:
+        raise RuntimeError("Layered activation rows exceed the padded width")
+    if pad == 0:
+        return hidden_states, residual
+    hidden_states = _pad_token_rows(hidden_states, pad)
+    if residual is not None:
+        residual = _pad_token_rows(residual, pad)
+    return hidden_states, residual
