@@ -191,6 +191,25 @@
 #       Remove this patch once upstream vLLM supports hybrid KV cache + CP for
 #       non-CUDA backends, or exposes a platform hook for this behavior.
 #
+# ** 10. File: platform/patch_layered_wavefront.py**
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#   1. `vllm.v1.core.sched.scheduler.Scheduler._get_layered_prefill_candidate`
+#      `vllm.v1.core.sched.scheduler.Scheduler._attach_fused_mixed_decodes`
+#      `vllm.v1.core.sched.scheduler.Scheduler._is_layered_decode_request`
+#    Why:
+#       A layered-prefill layer group runs on one PP stage and the vLLM policy
+#       keeps one prompt in the layer pipeline, so at PP=N only one stage has
+#       prefill work per step.
+#    How：
+#       `layered_prefill_config.max_concurrent_layered_prefills` (default 1,
+#       clamped to PP size) admits up to that many prompts, staggered so each
+#       holds a group on a different stage.  With `fuse_mixed_batch`, a decode
+#       already riding one prompt's span is not recruited by another.
+#    Related PR (if no, explain why):
+#       No, layered prefill lives in the gjc0824/vllm layer_prefill branch.
+#    Future Plan:
+#       Move the policy into vllm/v1/core/layered_prefill.py and the scheduler.
+#
 # ** 10. File: platform/patch_mamba_config.py**
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 #   1. `vllm.model_executor.models.config.HybridAttentionMambaModelConfig.verify_and_update_config`
