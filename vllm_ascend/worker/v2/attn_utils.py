@@ -344,6 +344,13 @@ def build_attn_state(
             attn_state = AscendAttentionState.SpecDecoding
         else:
             attn_state = AscendAttentionState.ChunkedPrefill
+    # Decode + prefill in one batch (same_layer / fuse).  PrefillCacheHit
+    # attends only to paged KV; a new prefill has empty cache and last-token
+    # hidden collapses to zeros (smoke: 48× token-id 0).
+    elif np.any(np.asarray(num_scheduled_tokens) > 1) and np.any(
+        seq_lens_np[:num_reqs] > np.asarray(num_scheduled_tokens)
+    ):
+        attn_state = AscendAttentionState.ChunkedPrefill
     # splitfuse
     elif vllm_config.scheduler_config.enable_chunked_prefill:
         attn_state = AscendAttentionState.ChunkedPrefill
