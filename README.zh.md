@@ -76,6 +76,8 @@ layered G=4：`mix_frac=1.0`，124 个 layered step。V1 对 PP=2/4 与 TP=2+PP=
 
 上表 DSV4-Flash TP8+EP 为 PP=1。DSV4 的 PP=2/4 未跑。未覆盖：bubble 时间、cancel/preempt/finish、logits/KV。PP=4 上 graph 与 eager 的 Prefill token 可能不一致（关闭 layered 时同样存在）。`max_num_seqs>1` 时，中段 token 可能与 layered-off 不一致；单请求 TP=2 可逐 token 对齐。
 
+PP=4、TP=1 的 chunked / layered / `fuse_mixed_batch` 结果见 [QWEN3_PP4_CHUNK_LAYER_FUSE.md](QWEN3_PP4_CHUNK_LAYER_FUSE.md)。
+
 ---
 *最新消息* 🔥
 
