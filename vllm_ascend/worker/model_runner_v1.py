@@ -317,6 +317,25 @@ class LayeredExecuteModelState(NamedTuple):
     main_sampling_masks: tuple[np.ndarray, int, np.ndarray]
 
 
+class LayeredPendingSubBatchState(NamedTuple):
+    """A layered P subbatch whose forward must wait for D sampling."""
+
+    input_batch: NPUInputBatch
+    scheduler_output: "SchedulerOutput"
+    intermediate_tensors: IntermediateTensors | None
+    moe_comm_token_count: int
+
+
+class LayeredMTPExecuteModelState(NamedTuple):
+    """D state and deferred P work for one MTP layered step."""
+
+    scheduler_output: "SchedulerOutput"
+    decode_sub_batch: LayeredSubBatchState
+    pending_prefill: LayeredPendingSubBatchState
+    main_input_batch: NPUInputBatch
+    main_sampling_masks: tuple[np.ndarray, int, np.ndarray]
+
+
 class NPUModelRunner(GPUModelRunner):
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         # Must be set before super().__init__() because parent init may call
@@ -582,11 +601,20 @@ class NPUModelRunner(GPUModelRunner):
         )
         # for cleancode , actually the three attrs is defined in gpu_model_runner
         self.execute_model_state: (
-            ExecuteModelState | LayeredExecuteModelState | None
+            ExecuteModelState
+            | LayeredExecuteModelState
+            | LayeredMTPExecuteModelState
+            | None
         ) = None
         self.layered_prefill_input_batch: NPUInputBatch | None = None
         self._executing_layered_subbatch = False
         self._layered_moe_comm_token_count: int | None = None
+        self._pending_layered_draft_token_ids: DraftTokenIds | None = None
+        # Raised while the layered P subbatch samples under async scheduling:
+        # its propose has no consumer there and would clobber D-side live
+        # draft/counts state. Gates the counts reset and the propose block
+        # in sample_tokens().
+        self._suppress_layered_prefill_spec_state = False
         # None in the first PP rank. The rest are set after load_model.
         self.intermediate_tensors: IntermediateTensors | None = None
         self.reorder_batch_threshold: int | None = None
@@ -1791,6 +1819,10 @@ class NPUModelRunner(GPUModelRunner):
             self.draft_token_ids_event.record()
 
     def take_draft_token_ids(self) -> DraftTokenIds | None:
+        if self._pending_layered_draft_token_ids is not None:
+            out = self._pending_layered_draft_token_ids
+            self._pending_layered_draft_token_ids = None
+            return out
         out = super().take_draft_token_ids()
         if out is None:
             return None
@@ -2074,6 +2106,86 @@ class NPUModelRunner(GPUModelRunner):
             intermediate_tensors
         )
 
+        use_layered_mtp_interleave = (
+            self.speculative_config is not None
+            and self.speculative_config.method == "mtp"
+            and get_pp_group().world_size == 1
+        )
+        if use_layered_mtp_interleave and d_req_ids:
+            if self._pending_layered_draft_token_ids is not None:
+                raise RuntimeError(
+                    "Layered MTP drafts were not consumed by the previous step"
+                )
+            self._executing_layered_subbatch = True
+            try:
+                self.input_batch = main_input_batch
+                self.execute_model_state = None
+                self._layered_moe_comm_token_count = None
+                d_output = self._subset_scheduler_output(
+                    scheduler_output,
+                    d_req_ids,
+                    layered_plan=None,
+                    include_one_time_updates=True,
+                )
+                result = self.execute_model(d_output, d_intermediate)
+                if result is not None:
+                    raise RuntimeError(
+                        "Layered MTP D forward returned an unexpected output"
+                    )
+                execute_state = self.execute_model_state
+                if not isinstance(execute_state, ExecuteModelState):
+                    raise RuntimeError(
+                        "Missing execute state for layered MTP D subbatch"
+                    )
+                discard_indices, num_discarded, discard_mask = (
+                    self._capture_layered_sampling_masks()
+                )
+                main_sampling_masks = (
+                    discard_indices.copy(),
+                    num_discarded,
+                    discard_mask.copy(),
+                )
+                decode_sub_batch = LayeredSubBatchState(
+                    input_batch=main_input_batch,
+                    execute_state=execute_state,
+                    kv_connector_output=self.kv_connector_output,
+                    discard_request_indices=discard_indices,
+                    num_discarded_requests=num_discarded,
+                    discard_request_mask=discard_mask,
+                )
+
+                for req_id in scheduler_output.finished_req_ids:
+                    p_input_batch.remove_request(req_id)
+                p_output = self._subset_scheduler_output(
+                    scheduler_output,
+                    p_req_ids,
+                    layered_plan=plan,
+                    include_one_time_updates=False,
+                )
+                pending_prefill = LayeredPendingSubBatchState(
+                    input_batch=p_input_batch,
+                    scheduler_output=p_output,
+                    intermediate_tensors=p_intermediate,
+                    moe_comm_token_count=getattr(
+                        scheduler_output,
+                        "total_num_scheduled_tokens",
+                        sum(scheduler_output.num_scheduled_tokens.values()),
+                    ),
+                )
+                self.execute_model_state = LayeredMTPExecuteModelState(
+                    scheduler_output=scheduler_output,
+                    decode_sub_batch=decode_sub_batch,
+                    pending_prefill=pending_prefill,
+                    main_input_batch=main_input_batch,
+                    main_sampling_masks=main_sampling_masks,
+                )
+                self.kv_connector_output = None
+            finally:
+                self._executing_layered_subbatch = False
+                self._layered_moe_comm_token_count = None
+                self.input_batch = main_input_batch
+            return None
+
         self._executing_layered_subbatch = True
         one_time_updates_pending = True
         try:
@@ -2114,17 +2226,19 @@ class NPUModelRunner(GPUModelRunner):
                 one_time_updates_pending = False
                 result = self.execute_model(sub_output, active_intermediate)
                 if active_batch is p_input_batch:
-                    # P attention writes the prompt KV cache on auxiliary
-                    # streams on Ascend.  The next scheduler step may replay
-                    # the Decode graph immediately; wait here so graph
-                    # reads cannot race the preceding P cache update.
-                    torch.npu.synchronize()
+                    # P attention writes the prompt KV cache, and internal
+                    # stream forks (DSA overlap, graph task updates) rejoin
+                    # the current stream before forward returns.  Wait for
+                    # that stream only, so the next step's Decode graph
+                    # replay cannot race the preceding P cache update while
+                    # unrelated device work keeps running.
+                    torch.npu.current_stream().synchronize()
                 if isinstance(result, IntermediateTensors):
                     # A non-last rank has no sampling state.  Keep the result
                     # until both views have completed and then forward them as
                     # one PP payload.
                     if active_batch is main_input_batch and p_req_ids:
-                        torch.npu.synchronize()
+                        torch.npu.current_stream().synchronize()
                         stable_result = IntermediateTensors(
                             {
                                 key: value.clone()
@@ -2146,8 +2260,10 @@ class NPUModelRunner(GPUModelRunner):
                     # (for example MC2 for a one-token D batch and AllGather
                     # for a long P batch).  Their collectives may use distinct
                     # runtime streams, so establish a visible boundary before
-                    # starting the next subbatch.
-                    torch.npu.synchronize()
+                    # starting the next subbatch.  Waiting for the current
+                    # stream drains everything this subbatch enqueued;
+                    # kernels that fork internally rejoin before returning.
+                    torch.npu.current_stream().synchronize()
                 execute_state = self.execute_model_state
                 if not isinstance(execute_state, ExecuteModelState):
                     raise RuntimeError("Missing execute state for layered subbatch")
@@ -2321,6 +2437,35 @@ class NPUModelRunner(GPUModelRunner):
         return IntermediateTensors(tensors)
 
     @staticmethod
+    def _merge_layered_draft_token_ids(
+        scheduler_output: "SchedulerOutput",
+        drafts: list[DraftTokenIds | None],
+    ) -> DraftTokenIds | None:
+        by_req_id: dict[str, list[int]] = {}
+        for draft in drafts:
+            if draft is None:
+                continue
+            for req_id, token_ids in zip(
+                draft.req_ids, draft.draft_token_ids
+            ):
+                if req_id in by_req_id:
+                    raise RuntimeError(
+                        f"duplicate layered draft for {req_id}"
+                    )
+                by_req_id[req_id] = token_ids
+        req_ids = [
+            req_id
+            for req_id in scheduler_output.num_scheduled_tokens
+            if req_id in by_req_id
+        ]
+        if not req_ids:
+            return None
+        return DraftTokenIds(
+            req_ids,
+            [by_req_id[req_id] for req_id in req_ids],
+        )
+
+    @staticmethod
     def _merge_layered_outputs(
         scheduler_output: "SchedulerOutput",
         outputs: list[ModelRunnerOutput],
@@ -2425,6 +2570,197 @@ class NPUModelRunner(GPUModelRunner):
             )
         return merged
 
+    def _commit_layered_sampled_tokens(self, output: ModelRunnerOutput) -> None:
+        """Resolve the async-sampled first token of the layered P request.
+
+        Under async scheduling the P row's sampled id is recorded as a -1
+        placeholder in ``req_state.output_token_ids`` (see the sampling
+        bookkeeping) until it is needed by a logits processor.  The request
+        re-enters the main input batch on the next step, and ``add_request``
+        seeds ``token_ids_cpu`` from ``req_state.output_token_ids``, so the
+        placeholder must be resolved here: the scheduler cannot echo the
+        token back because the next schedule() runs before update_from_output()
+        of this step.
+        """
+        for req_id in self.input_batch.req_ids:
+            req_index = output.req_id_to_index.get(req_id)
+            if req_index is None:
+                continue
+            sampled_ids = (
+                output.sampled_token_ids[req_index]
+                if output.sampled_token_ids
+                else []
+            )
+            if not sampled_ids:
+                continue
+            req_state = self.requests.get(req_id)
+            if req_state is None:
+                continue
+            output_token_ids = req_state.output_token_ids
+            first_placeholder = len(output_token_ids)
+            while (
+                first_placeholder > 0
+                and output_token_ids[first_placeholder - 1] == -1
+            ):
+                first_placeholder -= 1
+            num_placeholders = len(output_token_ids) - first_placeholder
+            if num_placeholders <= 0:
+                # Nothing left to resolve; some tokens may already be real
+                # after a KV-load failure discarded the placeholder tail.
+                continue
+            num_to_replace = min(len(sampled_ids), num_placeholders)
+            output_token_ids[
+                first_placeholder : first_placeholder + num_to_replace
+            ] = sampled_ids[:num_to_replace]
+
+    def _sample_layered_mtp_subbatch(
+        self,
+        sub_batch: LayeredSubBatchState,
+        grammar_output: "GrammarOutput | None",
+    ) -> ModelRunnerOutput:
+        self.input_batch = sub_batch.input_batch
+        self._restore_layered_sampling_masks(
+            (
+                sub_batch.discard_request_indices,
+                sub_batch.num_discarded_requests,
+                sub_batch.discard_request_mask,
+            )
+        )
+        self.execute_model_state = sub_batch.execute_state
+        self.kv_connector_output = sub_batch.kv_connector_output
+        active_grammar_output = grammar_output
+        if grammar_output is not None and not any(
+            req_id in grammar_output.structured_output_request_ids
+            for req_id in self.input_batch.req_ids
+        ):
+            active_grammar_output = None
+        output = self.sample_tokens(active_grammar_output)
+        if isinstance(output, AsyncModelRunnerOutput):
+            output = output.get_output()
+        if output is None:
+            output = EMPTY_MODEL_RUNNER_OUTPUT
+        if not isinstance(output, ModelRunnerOutput):
+            raise RuntimeError("Layered prefill sampling returned PP tensors")
+        return output
+
+    def _execute_pending_layered_prefill(
+        self,
+        pending: LayeredPendingSubBatchState,
+    ) -> LayeredSubBatchState:
+        self.input_batch = pending.input_batch
+        self.execute_model_state = None
+        self.kv_connector_output = None
+        self._executing_layered_subbatch = True
+        self._layered_moe_comm_token_count = pending.moe_comm_token_count
+        try:
+            result = self.execute_model(
+                pending.scheduler_output,
+                pending.intermediate_tensors,
+            )
+        finally:
+            self._executing_layered_subbatch = False
+            self._layered_moe_comm_token_count = None
+        if result is not None:
+            raise RuntimeError(
+                "Layered MTP P forward returned an unexpected output"
+            )
+        # P attention writes the prompt KV cache, and internal stream forks
+        # (DSA overlap, graph task updates) rejoin the current stream before
+        # forward returns.  Wait for that stream only, mirroring the layered
+        # loop's sync points.
+        torch.npu.current_stream().synchronize()
+        execute_state = self.execute_model_state
+        if not isinstance(execute_state, ExecuteModelState):
+            raise RuntimeError(
+                "Missing execute state for layered MTP P subbatch"
+            )
+        discard_indices, num_discarded, discard_mask = (
+            self._capture_layered_sampling_masks()
+        )
+        return LayeredSubBatchState(
+            input_batch=pending.input_batch,
+            execute_state=execute_state,
+            kv_connector_output=self.kv_connector_output,
+            discard_request_indices=discard_indices,
+            num_discarded_requests=num_discarded,
+            discard_request_mask=discard_mask,
+        )
+
+    def _sample_layered_mtp_step(
+        self,
+        state: LayeredMTPExecuteModelState,
+        grammar_output: "GrammarOutput | None",
+    ) -> ModelRunnerOutput:
+        scheduler_output = state.scheduler_output
+        plan = scheduler_output.layered_prefill_plan
+        assert plan is not None
+        async_mode = self.use_async_scheduling
+        drafts: list[DraftTokenIds | None] = []
+        outputs: list[ModelRunnerOutput] = []
+        try:
+            outputs.append(
+                self._sample_layered_mtp_subbatch(
+                    state.decode_sub_batch,
+                    grammar_output,
+                )
+            )
+            if not async_mode:
+                drafts.append(self.take_draft_token_ids())
+
+            # D's sampled/proposed work must land before the P forward
+            # overwrites the shared target-forward workspaces.  Waiting for
+            # the current stream drains everything D enqueued; kernels that
+            # fork internally rejoin before returning.
+            torch.npu.current_stream().synchronize()
+            p_sub_batch = self._execute_pending_layered_prefill(
+                state.pending_prefill
+            )
+            if async_mode:
+                # The P subbatch's propose has no consumer under async
+                # scheduling (its first decode step gets no draft slots)
+                # and would clobber D's live draft/counts state; bypass
+                # runner-level spec state for its sampling.
+                self._suppress_layered_prefill_spec_state = True
+            try:
+                p_output = self._sample_layered_mtp_subbatch(
+                    p_sub_batch,
+                    grammar_output,
+                )
+            finally:
+                self._suppress_layered_prefill_spec_state = False
+            outputs.append(p_output)
+            if async_mode:
+                if not p_sub_batch.execute_state.layered_prefill_intermediate:
+                    self._commit_layered_sampled_tokens(p_output)
+            else:
+                drafts.append(
+                    self.take_draft_token_ids()
+                    if plan.is_sampling_step
+                    else None
+                )
+            merged_output = self._merge_layered_outputs(
+                scheduler_output,
+                outputs,
+            )
+            if not async_mode:
+                self._pending_layered_draft_token_ids = (
+                    self._merge_layered_draft_token_ids(
+                        scheduler_output,
+                        drafts,
+                    )
+                )
+            return merged_output
+        except Exception:
+            self._pending_layered_draft_token_ids = None
+            raise
+        finally:
+            self.execute_model_state = None
+            self.kv_connector_output = None
+            self.input_batch = state.main_input_batch
+            self._restore_layered_sampling_masks(
+                state.main_sampling_masks
+            )
+
     def _sample_layered_step(
         self, grammar_output: "GrammarOutput | None"
     ) -> ModelRunnerOutput:
@@ -2453,13 +2789,36 @@ class NPUModelRunner(GPUModelRunner):
                     for req_id in self.input_batch.req_ids
                 ):
                     active_grammar_output = None
-                output = self.sample_tokens(active_grammar_output)
+                suppress_spec_state = (
+                    self.use_async_scheduling
+                    and self.speculative_config is not None
+                    and sub_batch.input_batch is not layered_state.main_input_batch
+                )
+                if suppress_spec_state:
+                    # Same rationale as the MTP interleave path: the P
+                    # subbatch's propose has no consumer under async
+                    # scheduling and would clobber D-side live
+                    # draft/counts state.
+                    self._suppress_layered_prefill_spec_state = True
+                try:
+                    output = self.sample_tokens(active_grammar_output)
+                finally:
+                    self._suppress_layered_prefill_spec_state = False
                 if isinstance(output, AsyncModelRunnerOutput):
                     output = output.get_output()
                 if output is None:
                     output = EMPTY_MODEL_RUNNER_OUTPUT
                 if not isinstance(output, ModelRunnerOutput):
                     raise RuntimeError("Layered prefill sampling returned PP tensors")
+                if (
+                    self.use_async_scheduling
+                    and self.input_batch is not layered_state.main_input_batch
+                    and not sub_batch.execute_state.layered_prefill_intermediate
+                ):
+                    # The P subbatch just sampled its first token; commit the
+                    # real id to req_state before the request migrates back
+                    # to the main input batch on the next step.
+                    self._commit_layered_sampled_tokens(output)
                 outputs.append(output)
         finally:
             self.execute_model_state = None
@@ -3068,6 +3427,10 @@ class NPUModelRunner(GPUModelRunner):
     def sample_tokens(
         self, grammar_output: "GrammarOutput | None"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors:
+        if isinstance(self.execute_model_state, LayeredMTPExecuteModelState):
+            state = self.execute_model_state
+            self.execute_model_state = None
+            return self._sample_layered_mtp_step(state, grammar_output)
         if isinstance(self.execute_model_state, LayeredExecuteModelState):
             return self._sample_layered_step(grammar_output)
 
@@ -3149,7 +3512,12 @@ class NPUModelRunner(GPUModelRunner):
             assert self.sampling_done_event is not None
             self.sampling_done_event.record()
 
-        self.valid_sampled_token_count_gpu = None
+        # Keep the counts reference D's propose stashed when the layered P
+        # subbatch samples under async scheduling: nulling it here would
+        # silently disable both num_computed_tokens corrections on the next
+        # step.
+        if not self._suppress_layered_prefill_spec_state:
+            self.valid_sampled_token_count_gpu = None
 
         def propose_draft_token_ids(sampled_token_ids):
             assert spec_decode_common_attn_metadata is not None
@@ -3206,7 +3574,14 @@ class NPUModelRunner(GPUModelRunner):
         )
 
         with record_function_or_nullcontext("draft_token"):
-            if self.speculative_config:
+            if (
+                self.speculative_config
+                and not self._suppress_layered_prefill_spec_state
+            ):
+                # The layered P subbatch under async scheduling bypasses
+                # the propose path entirely: its draft has no consumer
+                # there and its propose would clobber D-side live
+                # draft/counts state.
                 if not early_pp_padded_drafter:
                     self._draft_token_ids = None
                     self._draft_token_req_ids = None
@@ -3552,6 +3927,36 @@ class NPUModelRunner(GPUModelRunner):
             self._update_full_graph_params_if_needed(forward_context, num_tokens_padded)
 
         return hidden_states
+
+    @staticmethod
+    def _round_capture_sizes_for_tp_padding(
+        sizes: list[int], max_size: int, query_len: int, tp_size: int
+    ) -> list[int] | None:
+        """Align spec-decode graph sizes to lcm(query_len, tp_size).
+
+        Spec decode rounds capture sizes to ``1 + num_speculative_tokens``,
+        but SP/DSA-CP runtimes round token counts up to ``tensor_parallel_size``
+        before dispatch.  Unless the graph buckets are aligned to the least
+        common multiple, a padded count can fall between buckets and pad up
+        to a descriptor whose ``num_reqs`` no longer matches the batch that
+        was built for the unpadded count (e.g. 372 -> 376 -> bucket 384,
+        62 rows vs 64 slots).
+        """
+        if tp_size <= 1 or query_len <= 1 or not sizes:
+            return None
+        lcm = tp_size * query_len // math.gcd(tp_size, query_len)
+        if lcm <= query_len:
+            return None
+        rounded = sorted(
+            {
+                round_up(size, lcm)
+                for size in sizes
+                if round_up(size, lcm) <= max_size
+            }
+        )
+        if not rounded and lcm <= max_size:
+            rounded = [lcm]
+        return rounded or None
 
     def _pad_for_sequence_parallelism(self, num_scheduled_tokens: int) -> int:
         # Pad tokens to multiple of tensor_parallel_size when
@@ -5729,6 +6134,18 @@ class NPUModelRunner(GPUModelRunner):
                 kv_cache_config=self.kv_cache_config,
                 max_num_reqs=self.max_num_reqs,
             )
+            if self.speculative_config and self._pad_for_sequence_parallelism(1) != 1:
+                # Graph buckets must survive the runtime TP round-up done by
+                # _pad_for_sequence_parallelism (SP / DSA-CP); see the helper.
+                aligned = self._round_capture_sizes_for_tp_padding(
+                    self.compilation_config.cudagraph_capture_sizes,
+                    self.compilation_config.max_cudagraph_capture_size,
+                    self.uniform_decode_query_len,
+                    self.vllm_config.parallel_config.tensor_parallel_size,
+                )
+                if aligned is not None and aligned != self.compilation_config.cudagraph_capture_sizes:
+                    self.compilation_config.cudagraph_capture_sizes = aligned
+                    self.compilation_config.max_cudagraph_capture_size = aligned[-1]
             self.cudagraph_dispatcher.initialize_cudagraph_keys(
                 cudagraph_mode, self.uniform_decode_query_len
             )

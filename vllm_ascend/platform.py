@@ -880,10 +880,13 @@ def _check_ascend_config(vllm_config: VllmConfig, ascend_config) -> None:
         # when EP is enabled, the Ascend AlltoAll path restores the physical
         # TP token split after vLLM collapses routed-expert TP to one.
         # PP>1 uses a stage-aligned global layer plan and transports D/P rows in
-        # one message per step.  DBO remains disabled because it introduces
-        # multiple in-flight frontiers.  Prefix cache and async scheduling are
-        # allowed on Model Runner V2: prefix hits skip already-complete layers,
-        # and async serializes a request's layer groups on num_in_flight_tokens.
+        # one message per step.  Async scheduling is allowed at PP=1 on V1 and
+        # on Model Runner V2.  Async with PP>1 stays rejected: that path
+        # broadcasts sampled tokens through a GPU ring the layered one-send
+        # payload does not join.  DBO remains disabled because it introduces
+        # multiple in-flight frontiers.  Prefix hits skip already-complete
+        # layers, and async serializes a request's layer groups on
+        # num_in_flight_tokens.
         # sequence parallelism is still rejected below because it changes the
         # frontier/token-row layout.  DP remains restricted to one rank until
         # the scheduler plan is synchronized across DP/EP ranks.
@@ -892,11 +895,13 @@ def _check_ascend_config(vllm_config: VllmConfig, ascend_config) -> None:
         # remains default-off).  The V2 NPUModelRunner runs D→P at PP=1 and
         # PP>1: activations pack like V1; sampled tokens share one PPHandler
         # slot (D ∪ final P; intermediate P groups are excluded).
-        use_v2 = bool(getattr(vllm_config, "use_v2_model_runner", False))
-        if vllm_config.scheduler_config.async_scheduling and not use_v2:
+        if (
+            vllm_config.scheduler_config.async_scheduling
+            and parallel_config.pipeline_parallel_size > 1
+        ):
             raise ValueError(
                 "layered_prefill_config does not support async_scheduling "
-                "on Model Runner V1"
+                "with pipeline_parallel_size > 1"
             )
         if getattr(parallel_config, "enable_dbo", False):
             raise ValueError(
@@ -982,9 +987,15 @@ def _check_ascend_config(vllm_config: VllmConfig, ascend_config) -> None:
             raise ValueError(
                 "layered_prefill_config Phase 1 requires connector-free PD-mixed mode"
             )
-        if getattr(vllm_config, "speculative_config", None) is not None:
+        speculative_config = getattr(vllm_config, "speculative_config", None)
+        if speculative_config is not None and not (
+            is_deepseek_v4
+            and getattr(speculative_config, "method", None) == "mtp"
+            and parallel_config.pipeline_parallel_size == 1
+        ):
             raise ValueError(
-                "layered_prefill_config Phase 1 does not support speculative decoding"
+                "layered_prefill_config currently only supports "
+                "DeepSeek-V4 MTP with PP=1"
             )
         if getattr(vllm_config, "lora_config", None) is not None:
             raise ValueError(

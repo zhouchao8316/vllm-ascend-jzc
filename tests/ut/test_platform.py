@@ -352,11 +352,100 @@ class TestNPUPlatform(TestBase):
         )
         _check_ascend_config(vllm_config, ascend_config)
 
-    def test_layered_prefill_v1_rejects_async_scheduling(self):
-        vllm_config, ascend_config = self._layered_platform_config(
-            use_v2=False, async_sched=True, prefix=False
+    def _make_layered_prefill_configs(self):
+        vllm_config = self.mock_vllm_config()
+        vllm_config.parallel_config.enable_dbo = False
+        vllm_config.parallel_config.enable_eplb = False
+        vllm_config.parallel_config.use_sequence_parallel_moe = False
+        vllm_config.model_config.architectures = ["Qwen3MoeForCausalLM"]
+        vllm_config.model_config.enforce_eager = True
+        vllm_config.model_config.is_multimodal = False
+        vllm_config.model_config.is_multimodal_model = False
+        vllm_config.model_config.enable_return_routed_experts = False
+        vllm_config.model_config.hf_text_config = SimpleNamespace(
+            model_type="qwen3_moe", num_hidden_layers=48
         )
-        with pytest.raises(ValueError, match="async_scheduling"):
+        vllm_config.lora_config = None
+        vllm_config.compilation_config.mode = CompilationMode.NONE
+        vllm_config.compilation_config.cudagraph_mode = CUDAGraphMode.NONE
+
+        cache_config = vllm_config.cache_config
+        cache_config.enable_prefix_caching = False
+        cache_config.kv_offloading_size = None
+        cache_config.mamba_cache_mode = "none"
+
+        ascend_config = self.mock_vllm_ascend_config()
+        layered_prefill_config = SimpleNamespace(enabled=True, require_eager=True)
+        ascend_config.scheduler_config.layered_prefill_config = layered_prefill_config
+        ascend_config.sparse_kv_offload_config.enabled = False
+        ascend_config.eplb_config.dynamic_eplb = False
+        ascend_config.enable_prefill_mc2 = False
+        ascend_config.multistream_overlap_shared_expert = False
+        return vllm_config, ascend_config
+
+    def test_layered_prefill_accepts_async_scheduling_at_pp1(self):
+        vllm_config, ascend_config = self._make_layered_prefill_configs()
+        vllm_config.scheduler_config.async_scheduling = True
+
+        _check_ascend_config(vllm_config, ascend_config)
+
+        vllm_config.model_config.enforce_eager = False
+        ascend_config.scheduler_config.layered_prefill_config.require_eager = False
+        vllm_config.compilation_config.mode = CompilationMode.VLLM_COMPILE
+        vllm_config.compilation_config.cudagraph_mode = CUDAGraphMode.FULL_DECODE_ONLY
+        _check_ascend_config(vllm_config, ascend_config)
+
+    def test_layered_prefill_rejects_async_scheduling_with_pp_gt_one(self):
+        vllm_config, ascend_config = self._make_layered_prefill_configs()
+        vllm_config.scheduler_config.async_scheduling = True
+        vllm_config.parallel_config.pipeline_parallel_size = 2
+
+        with pytest.raises(
+            ValueError, match="async_scheduling with pipeline_parallel_size > 1"
+        ):
+            _check_ascend_config(vllm_config, ascend_config)
+
+    def test_layered_prefill_accepts_deepseek_v4_mtp_on_pp1(self):
+        vllm_config = self.mock_vllm_config()
+        vllm_config.parallel_config.enable_dbo = False
+        vllm_config.parallel_config.enable_eplb = False
+        vllm_config.parallel_config.use_sequence_parallel_moe = False
+        vllm_config.model_config.architectures = ["DeepseekV4ForCausalLM"]
+        vllm_config.model_config.enforce_eager = True
+        vllm_config.model_config.is_multimodal = False
+        vllm_config.model_config.is_multimodal_model = False
+        vllm_config.model_config.enable_return_routed_experts = False
+        vllm_config.model_config.hf_text_config = SimpleNamespace(
+            model_type="deepseek_v4", num_hidden_layers=61
+        )
+        vllm_config.model_config.is_hybrid = True
+        vllm_config.lora_config = None
+        vllm_config.compilation_config.mode = CompilationMode.NONE
+        vllm_config.compilation_config.cudagraph_mode = CUDAGraphMode.NONE
+        vllm_config.cache_config.enable_prefix_caching = False
+        vllm_config.cache_config.kv_offloading_size = None
+        vllm_config.cache_config.mamba_cache_mode = "none"
+
+        ascend_config = self.mock_vllm_ascend_config()
+        ascend_config.scheduler_config.layered_prefill_config = SimpleNamespace(
+            enabled=True, require_eager=True
+        )
+        ascend_config.sparse_kv_offload_config.enabled = False
+        ascend_config.eplb_config.dynamic_eplb = False
+        ascend_config.enable_prefill_mc2 = False
+        ascend_config.multistream_overlap_shared_expert = False
+
+        vllm_config.speculative_config = SimpleNamespace(method="mtp")
+        for num_speculative_tokens in (1, 2, 4):
+            vllm_config.speculative_config.num_speculative_tokens = (
+                num_speculative_tokens
+            )
+            _check_ascend_config(vllm_config, ascend_config)
+
+        vllm_config.speculative_config.method = "eagle"
+        with pytest.raises(
+            ValueError, match="only supports DeepSeek-V4 MTP with PP=1"
+        ):
             _check_ascend_config(vllm_config, ascend_config)
 
     def test_get_recompute_scheduler_cls(self):
