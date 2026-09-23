@@ -40,15 +40,17 @@ vLLM Ascend Plugin
 - 并行：TP=8，EP，DP=1，PP=1，`VLLM_USE_V2_MODEL_RUNNER=1`
 - 图模式：`cudagraph_mode=FULL_DECODE_ONLY`
 - 压测：aisbench GSM8K stream，in=4096 / out=256 / n=16 / concurrency=8；prefix cache 关，async 关
-- 实验组：chunked（MBT=256、512）vs layered G=8（`allowed_num_groups=[8]`，`max_num_batched_tokens=16392`）；`max_num_seqs=8`。4k prompt 上 MBT=512 与 G=8 均为约 8 步 prefill；MBT=256 约 16 步。G=8 为单次测量，512 对照复用该结果。
+- 对照：chunked（MBT=256、512）vs layered G=8（`allowed_num_groups=[8]`，`max_num_batched_tokens=16392`）；`max_num_seqs=8`。4k prompt 上 MBT=512 与 G=8 均为约 8 步 prefill；MBT=256 约 16 步。G=8 为单次测量，512 对照复用该结果。
 
-| 实验组 | 请求 | TTFT avg (ms) | TPOT avg (ms) | E2EL avg (ms) | 输出吞吐 (tok/s) |
+| 臂 | 请求 | TTFT avg (ms) | TPOT avg (ms) | E2EL avg (ms) | 输出吞吐 (tok/s) |
 |---|:---:|---:|---:|---:|---:|
 | chunked MBT=256 | 16/16 | 11726.4 | 114.2 | 40844.7 | 48.6 |
 | chunked MBT=512 | 16/16 | 6848.3 | 85.7 | 28694.7 | 69.8 |
 | layered G=8 | 16/16（复用） | 2488.9 | 56.2 | 16832.6 | 117.1 |
 
 相对 chunked MBT=512（等步）：G=8 TTFT ≈ 2.8×，TPOT −29.5 ms，E2EL 与吞吐 ≈ 1.7×。MBT=256 步数多一倍，不作等步对照。单次 pass；无 ACL 507011。
+
+16k 输入（query=16384，out=512，n=24）的 chunked / layered / `fuse_mixed_batch` 结果见 [DSV4_TP8_16K_TOKEN_LAYER_FUSE.md](DSV4_TP8_16K_TOKEN_LAYER_FUSE.md)。
 
 ### Pipeline parallel
 
@@ -62,7 +64,7 @@ Qwen3-30B-A3B，V2，TP=1：
 | PP=4 | LLM smoke，含 4-hop frontier | 2026-09-17 | 通过 |
 | PP=4 | aisbench in=4096 / out=256 / n=32 / c=8 | 2026-09-17 | chunked、layered G=1、layered G=4 完成 |
 
-| 实验组 | TTFT avg (ms) | TPOT avg (ms) | 输出吞吐 (tok/s) |
+| 臂 | TTFT avg (ms) | TPOT avg (ms) | 输出吞吐 (tok/s) |
 |---|---:|---:|---:|
 | chunked | 1060.0 | 33.8 | 211.1 |
 | layered G=1 | 1322.1 | 42.4 | 166.6 |
