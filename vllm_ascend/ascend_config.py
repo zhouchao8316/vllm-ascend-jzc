@@ -1267,6 +1267,7 @@ class SchedulerConfig:
             p_group_decode_budget_ms=float(
                 layered_prefill_raw.get("p_group_decode_budget_ms", 0.0) or 0.0
             ),
+            max_chunk_tokens=int(layered_prefill_raw.get("max_chunk_tokens", 0) or 0),
         )
         self.layered_prefill_extensions = LayeredPrefillExtensions(layered_prefill_raw)
 

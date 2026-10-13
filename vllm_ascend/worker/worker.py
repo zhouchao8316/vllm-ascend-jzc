@@ -20,6 +20,8 @@
 import copy
 import gc
 import logging
+import os
+import time
 from types import NoneType
 from typing import Any
 
@@ -566,6 +568,14 @@ class NPUWorker(WorkerBase):
                     factor,
                 )
 
+        frontier_extra = int(getattr(self.model_runner, "layered_frontier_profile_bytes", 0) or 0)
+        if frontier_extra:
+            self.available_kv_cache_memory_bytes -= frontier_extra
+            logger.info(
+                "Layered Prefill frontier subtracted from KV budget: %.2f GiB",
+                GiB(frontier_extra),
+            )
+
         logger.debug(profile_result)
         logger.info_once(
             "Available KV cache memory: %.2f GiB", GiB(self.available_kv_cache_memory_bytes), scope="local"
@@ -666,7 +676,27 @@ class NPUWorker(WorkerBase):
                 getattr(self.model_runner, "_layered_prefill_v2_ready", None),
             )
 
+        trace_chunk = (
+            os.environ.get("VLLM_PP_CHUNK_TIMELINE") == "1" and forward_pass
+        )
+        trace_t0 = time.perf_counter() if trace_chunk else 0.0
         output = self.model_runner.execute_model(scheduler_output, intermediate_tensors)
+        if trace_chunk and any(
+            n > 1 for n in scheduler_output.num_scheduled_tokens.values()
+        ):
+            self._pp_chunk_trace_step = getattr(self, "_pp_chunk_trace_step", 0) + 1
+            logger.info(
+                "pp_chunk_timeline rank=%s step=%s tokens=%s ids=%s t0=%.6f t1=%.6f",
+                get_pp_group().rank_in_group,
+                self._pp_chunk_trace_step,
+                scheduler_output.total_num_scheduled_tokens,
+                ",".join(
+                    f"{req_id}:{n}"
+                    for req_id, n in scheduler_output.num_scheduled_tokens.items()
+                ),
+                trace_t0,
+                time.perf_counter(),
+            )
         if isinstance(output, (ModelRunnerOutput, AsyncModelRunnerOutput, NoneType)):
             return output
 
@@ -776,15 +806,19 @@ class NPUWorker(WorkerBase):
         if not self.model_config.enforce_eager:
             npugraph_memory_bytes = self.model_runner.capture_model()
 
-        # Suggest an optimal --kv-cache-memory value for future runs.
+        # Suggest an optimal --kv-cache-memory-bytes value for future runs.
         # Only emitted when we ran full profiling (kv_cache_memory_bytes was not
         # pre-specified) so that peak_activation_memory etc. are available.
         # non_kv_memory already includes NPU graph memory, so the suggestion
-        # accounts for all measured memory categories. A 150 MiB buffer is kept
-        # because memory_profiling may slightly underestimate non-torch
-        # allocations (ACL context, HCCL buffers, driver layer, etc.).
+        # accounts for all measured memory categories. The 150 MiB buffer below
+        # shrinks only this *suggestion*; the budget actually used for the KV
+        # cache is computed in determine_available_memory() and does not carry
+        # it. Note it does not cover the pp_broadcast HCCL communicator either:
+        # that buffer is materialized while PPHandler is constructed (see
+        # vllm_ascend/patch/worker/patch_v2/patch_pp_broadcast_buffer.py) so it
+        # lands in non_torch_memory like any other driver-side allocation.
         if self.cache_config.kv_cache_memory_bytes is None and hasattr(self, "peak_activation_memory"):
-            redundancy_buffer = 150 * (1 << 20)  # 150 MiB safety margin
+            redundancy_buffer = 150 * (1 << 20)  # 150 MiB, suggestion-only margin
             non_kv_memory = (
                 self.model_runner.model_memory_usage
                 + self.peak_activation_memory

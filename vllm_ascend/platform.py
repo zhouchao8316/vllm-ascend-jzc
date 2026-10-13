@@ -836,6 +836,16 @@ def _check_ascend_config(vllm_config: VllmConfig, ascend_config) -> None:
 
     layered_prefill_config = scheduler_extension_config.layered_prefill_config
     if layered_prefill_config.enabled:
+        max_chunk_tokens = int(getattr(layered_prefill_config, "max_chunk_tokens", 0) or 0)
+        if max_chunk_tokens > 0:
+            batched = int(vllm_config.scheduler_config.max_num_batched_tokens)
+            if batched > max_chunk_tokens:
+                logger.info(
+                    "Layered prefill caps max_num_batched_tokens from %s to %s",
+                    batched,
+                    max_chunk_tokens,
+                )
+                vllm_config.scheduler_config.max_num_batched_tokens = max_chunk_tokens
         parallel_config = vllm_config.parallel_config
         cache_config = vllm_config.cache_config
         kv_transfer_config = vllm_config.kv_transfer_config
@@ -881,9 +891,12 @@ def _check_ascend_config(vllm_config: VllmConfig, ascend_config) -> None:
         # TP token split after vLLM collapses routed-expert TP to one.
         # PP>1 uses a stage-aligned global layer plan and transports D/P rows in
         # one message per step.  Async scheduling is allowed at PP=1 on V1 and
-        # on Model Runner V2.  Async with PP>1 stays rejected: that path
-        # broadcasts sampled tokens through a GPU ring the layered one-send
-        # payload does not join.  DBO remains disabled because it introduces
+        # on Model Runner V2.  Async with multi-group layered PP stays
+        # rejected: that path broadcasts sampled tokens through a GPU ring the
+        # layered one-send payload does not join.  fuse_mixed_batch on PP>1 is
+        # a token-chunk wave (one full forward per chunk, same sample point as
+        # ordinary PP), so async PP is allowed there.  DBO remains disabled
+        # because it introduces
         # multiple in-flight frontiers.  Prefix hits skip already-complete
         # layers, and async serializes a request's layer groups on
         # num_in_flight_tokens.
@@ -895,9 +908,13 @@ def _check_ascend_config(vllm_config: VllmConfig, ascend_config) -> None:
         # remains default-off).  The V2 NPUModelRunner runs D→P at PP=1 and
         # PP>1: activations pack like V1; sampled tokens share one PPHandler
         # slot (D ∪ final P; intermediate P groups are excluded).
+        fuse_token_chunk = bool(
+            getattr(layered_prefill_config, "fuse_mixed_batch", False)
+        )
         if (
             vllm_config.scheduler_config.async_scheduling
             and parallel_config.pipeline_parallel_size > 1
+            and not fuse_token_chunk
         ):
             raise ValueError(
                 "layered_prefill_config does not support async_scheduling "
